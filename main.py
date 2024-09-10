@@ -24,9 +24,9 @@ class CustomDataset(Dataset):
         rho: float = 0.0,
         noise_ratio: float = 0.0,
     ) -> None:
-        self.num_samples = num_samples
-        self.seq_len = seq_len
-        self.embed_dim = embed_dim
+        self._num_samples = num_samples
+        self._seq_len = seq_len
+        self._embed_dim = embed_dim
 
         assert vmu_1.size() == (embed_dim,), f"Signal vector vmu_1 size {vmu_1.size()} must be equal to {(embed_dim,)}"
         assert vmu_2.size() == (embed_dim,), f"Signal vector vmu_2 size {vmu_2.size()} must be equal to {(embed_dim,)}"
@@ -53,6 +53,10 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tensor:
         return self.data[idx], self.label[idx]
+
+    @property
+    def noisy_data_mask(self) -> int:
+        return self.noisy_data_mask
 
 
 class Attention(nn.Module):
@@ -149,6 +153,17 @@ def main(cfg: DictConfig) -> None:
         "label_flipped": [],
         "time_step": [],
         "attention_score": [],
+        "cumulative_attention": [],
+    }
+    dict_stats_time_step = {
+        "time_step": [],
+        "loss": [],
+        "train_accuracy": [],
+        "test_accuracy": [],
+        "mathfrak_s_1": [],
+        "mathfrak_s_2": [],
+        "alignment_vmu_1": [],
+        "alignment_vmu_2": [],
     }
 
     for time_step in range(cfg["num_steps"]):
@@ -159,25 +174,64 @@ def main(cfg: DictConfig) -> None:
             loss = torch.log(1.0 + torch.exp(-target * output)).mean()
             loss.backward()
             optimizer.step()
-        wandb.log(
-            {
-                "loss": loss.item(),
-                "train_accuracy": calc_accuracy(model, train_loader, device),
-                "test_accuracy": calc_accuracy(model, test_loader, device),
-            }
-        )
 
+        train_accuracy = calc_accuracy(model, train_loader, device)
+        test_accuracy = calc_accuracy(model, test_loader, device)
+
+        # Log stats
+        mathfrak_s_1, mathfrak_s_2 = 0.0, 0.0
         for sample_id in range(cfg["n"]):
             for token_id in range(cfg["T"]):
                 dict_attention_scores["sample_id"].append(sample_id)
                 dict_attention_scores["token_id"].append(token_id)
                 dict_attention_scores["label_flipped"].append(train_dataset.noisy_data_mask[sample_id].item())
                 dict_attention_scores["time_step"].append(time_step)
-                dict_attention_scores["attention_score"].append(attention_scores[sample_id, token_id].item())
+                attention_score = attention_scores[sample_id, token_id].item()
+                dict_attention_scores["attention_score"].append(attention_score)
+                if dict_attention_scores["cumulative_attention"]:
+                    dict_attention_scores["cumulative_attention"].append(
+                        dict_attention_scores["cumulative_attention"][-1] + attention_score * (1.0 - attention_score)
+                    )
+                else:
+                    dict_attention_scores["cumulative_attention"].append(attention_score * (1.0 - attention_score))
+            if not train_dataset.noisy_data_mask[sample_id]:
+                if train_dataset[sample_id][1] == 1:
+                    mathfrak_s_1 += dict_attention_scores["cumulative_attention"][-1]
+                if train_dataset[sample_id][1] == -1:
+                    mathfrak_s_2 += dict_attention_scores["cumulative_attention"][-1]
+
+        p_norm = torch.norm(model.p).item()
+        alignment_vmu_1 = model.p.squeeze()[0].item / p_norm
+        alignment_vmu_2 = model.p.squeeze()[1].item / p_norm
+
+        dict_stats_time_step["time_step"].append(time_step)
+        dict_stats_time_step["loss"].append(loss.item())
+        dict_stats_time_step["train_accuracy"].append(train_accuracy)
+        dict_stats_time_step["test_accuracy"].append(test_accuracy)
+        dict_stats_time_step["mathfrak_s_1"].append(mathfrak_s_1)
+        dict_stats_time_step["mathfrak_s_2"].append(mathfrak_s_2)
+        dict_stats_time_step["alignment_vmu_1"].append(alignment_vmu_1)
+        dict_stats_time_step["alignment_vmu_2"].append(alignment_vmu_2)
+
+        wandb.log(
+            {
+                "loss": loss.item(),
+                "train_accuracy": train_accuracy,
+                "test_accuracy": test_accuracy,
+                "mathfrak_s_1": mathfrak_s_1,
+                "mathfrak_s_2": mathfrak_s_2,
+                "alignment_vmu_1": alignment_vmu_1,
+                "alignment_vmu_2": alignment_vmu_2,
+            }
+        )
 
     df_attention_scores = pd.DataFrame.from_dict(dict_attention_scores)
+    df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
     df_attention_scores.to_csv(
         os.path.join(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "attention_scores.csv"), index=False
+    )
+    df_stats_time_step.to_csv(
+        os.path.join(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "stats_time_step.csv"), index=False
     )
 
 
