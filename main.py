@@ -1,9 +1,12 @@
+import os
+
 import numpy as np
 import torch
 from torch import nn, Tensor
 import pandas as pd
 import wandb
-
+import hydra
+from omegaconf import OmegaConf, DictConfig
 from torch.nn.init import zeros_, orthogonal_, eye_
 from torch.nn.parameter import Parameter
 from torch.optim import SGD
@@ -93,25 +96,15 @@ def calc_accuracy(model: nn.Module, loader: DataLoader, device: torch.device) ->
     return correct / total
 
 
-if __name__ == "__main__":
-    # Setting parameters
-    config = dict(
-        delta=0.01,
-        delta_r=0.1,
-        n=8,
-        T=8,
-        embed_dim=2000,
-        learning_rate=1e-4,
-        signal_norm=20.0,
-        num_steps=10000,
-        noise_ratio=0.1,
-        num_test_samples=1000,
-    )
-    nu_norm = 1 / config["signal_norm"]
+@hydra.main(config_path="config", config_name="main", version_base=None)
+def main(cfg: DictConfig) -> None:
+    wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb.init(project="benign_overfitting_attention")
 
-    wandb.init(project="benign_overfitting_attention", config=config)
+    # Same scale for the linear head as in the paper
+    nu_norm = 1 / cfg["signal_norm"]
 
-    # ndb device
+    # Device
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -120,24 +113,20 @@ if __name__ == "__main__":
         device = "cpu"
 
     # In this experiment, we use orthogonal basis e_1 and e_2 as signal vectors vmu_1 and vmu_2, respectively.
-    vmu_1 = torch.zeros(config["embed_dim"])
-    vmu_2 = torch.zeros(config["embed_dim"])
-    vmu_1[0] = config["signal_norm"]
-    vmu_2[1] = config["signal_norm"]
+    vmu_1 = torch.zeros(cfg["embed_dim"])
+    vmu_2 = torch.zeros(cfg["embed_dim"])
+    vmu_1[0] = cfg["signal_norm"]
+    vmu_2[1] = cfg["signal_norm"]
 
-    train_dataset = CustomDataset(
-        config["n"], config["T"], config["embed_dim"], vmu_1, vmu_2, noise_ratio=config["noise_ratio"]
-    )
-    test_dataset = CustomDataset(
-        config["num_test_samples"], config["T"], config["embed_dim"], vmu_1, vmu_2, noise_ratio=0.0
-    )
-    train_loader = DataLoader(train_dataset, batch_size=config["n"])
-    test_loader = DataLoader(test_dataset, batch_size=config["n"])
+    train_dataset = CustomDataset(cfg["n"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, noise_ratio=cfg["noise_ratio"])
+    test_dataset = CustomDataset(cfg["num_test_samples"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, noise_ratio=0.0)
+    train_loader = DataLoader(train_dataset, batch_size=cfg["n"])
+    test_loader = DataLoader(test_dataset, batch_size=cfg["n"])
 
-    model = Attention(embed_dim=config["embed_dim"], device=device)
+    model = Attention(embed_dim=cfg["embed_dim"], device=device)
     model.init_linear_head(vmu_1, vmu_2, nu_norm)
     params = [model.p]
-    optimizer = SGD(params, lr=config["learning_rate"])
+    optimizer = SGD(params, lr=cfg["learning_rate"])
     dict_attention_scores = {
         "sample_id": [],
         "token_id": [],
@@ -146,7 +135,7 @@ if __name__ == "__main__":
         "attention_score": [],
     }
 
-    for time_step in range(config["num_steps"]):
+    for time_step in range(cfg["num_steps"]):
         for _, (data, target) in enumerate(train_loader):
             optimizer.zero_grad()
             data, target = data.to(device), target.to(device)
@@ -162,8 +151,8 @@ if __name__ == "__main__":
             }
         )
 
-        for sample_id in range(config["n"]):
-            for token_id in range(config["T"]):
+        for sample_id in range(cfg["n"]):
+            for token_id in range(cfg["T"]):
                 dict_attention_scores["sample_id"].append(sample_id)
                 dict_attention_scores["token_id"].append(token_id)
                 dict_attention_scores["label_flipped"].append(train_dataset.noisy_data_mask[sample_id].item())
@@ -171,4 +160,10 @@ if __name__ == "__main__":
                 dict_attention_scores["attention_score"].append(attention_scores[sample_id, token_id].item())
 
     df_attention_scores = pd.DataFrame.from_dict(dict_attention_scores)
-    df_attention_scores.to_csv("attention_scores.csv", index=False)
+    df_attention_scores.to_csv(
+        os.path.join(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "attention_scores.csv"), index=False
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - _self_
+
+delta: 0.01
+n: 8
+T: 8
+embed_dim: 2000
+learning_rate: 1e-4
+signal_norm: 20.0
+num_steps: 10000
+noise_ratio: 0.1
+num_test_samples: 1000
