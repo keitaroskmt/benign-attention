@@ -15,7 +15,14 @@ from torch.utils.data import DataLoader, Dataset
 
 class CustomDataset(Dataset):
     def __init__(
-        self, num_samples: int, seq_len: int, embed_dim: int, vmu_1: Tensor, vmu_2: Tensor, noise_ratio: float = 0.0
+        self,
+        num_samples: int,
+        seq_len: int,
+        embed_dim: int,
+        vmu_1: Tensor,
+        vmu_2: Tensor,
+        rho: float = 0.0,
+        noise_ratio: float = 0.0,
     ) -> None:
         self.num_samples = num_samples
         self.seq_len = seq_len
@@ -23,11 +30,16 @@ class CustomDataset(Dataset):
 
         assert vmu_1.size() == (embed_dim,), f"Signal vector vmu_1 size {vmu_1.size()} must be equal to {(embed_dim,)}"
         assert vmu_2.size() == (embed_dim,), f"Signal vector vmu_2 size {vmu_2.size()} must be equal to {(embed_dim,)}"
+        assert rho > 0.0, "rho must be the positive constant"
 
         self.label = torch.randint(0, 2, (num_samples,)) * 2 - 1
         self.data = torch.randn(num_samples, seq_len, embed_dim)
-        # Add signal vectors to the first token of each sample
+        # First token is relevant token
         self.data[:, 0, :] = self.data[:, 0, :] + torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+        # Second token is weakly relevant token that aligns with the relevant token
+        self.data[:, 1, :] = self.data[:, 1, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+        # Third token is weakly relevant token that aligns with the opposite direction of relevant token
+        self.data[:, 2, :] = self.data[:, 2, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_2, vmu_1)
         # Create noisy data
         noisy_data_size = int(np.ceil(num_samples * noise_ratio))
         self.noisy_data_mask = torch.zeros(num_samples, dtype=torch.bool)
@@ -118,8 +130,12 @@ def main(cfg: DictConfig) -> None:
     vmu_1[0] = cfg["signal_norm"]
     vmu_2[1] = cfg["signal_norm"]
 
-    train_dataset = CustomDataset(cfg["n"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, noise_ratio=cfg["noise_ratio"])
-    test_dataset = CustomDataset(cfg["num_test_samples"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, noise_ratio=0.0)
+    train_dataset = CustomDataset(
+        cfg["n"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, rho=cfg["rho"], noise_ratio=cfg["noise_ratio"]
+    )
+    test_dataset = CustomDataset(
+        cfg["num_test_samples"], cfg["T"], cfg["embed_dim"], vmu_1, vmu_2, rho=cfg["rho"], noise_ratio=0.0
+    )
     train_loader = DataLoader(train_dataset, batch_size=cfg["n"])
     test_loader = DataLoader(test_dataset, batch_size=cfg["n"])
 
