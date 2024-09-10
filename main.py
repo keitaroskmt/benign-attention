@@ -98,18 +98,20 @@ class Attention(nn.Module):
         return self.forward_with_scores(x)[0]
 
 
-def calc_accuracy(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+def calc_accuracy_and_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
     model.eval()
     correct = 0
+    loss_total = 0
     total = 0
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
             pred = model(data)
             correct += (pred * target > 0).sum().item()
+            loss_total += torch.log(1.0 + torch.exp(-target * pred)).sum().item()
             total += target.size(0)
     model.train()
-    return correct / total
+    return correct / total, loss_total / total
 
 
 @hydra.main(config_path="config", config_name="main", version_base=None)
@@ -160,6 +162,8 @@ def main(cfg: DictConfig) -> None:
         "loss": [],
         "train_accuracy": [],
         "test_accuracy": [],
+        "train_loss": [],
+        "test_loss": [],
         "mathfrak_s_1": [],
         "mathfrak_s_2": [],
         "alignment_vmu_1": [],
@@ -174,9 +178,6 @@ def main(cfg: DictConfig) -> None:
             loss = torch.log(1.0 + torch.exp(-target * output)).mean()
             loss.backward()
             optimizer.step()
-
-        train_accuracy = calc_accuracy(model, train_loader, device)
-        test_accuracy = calc_accuracy(model, test_loader, device)
 
         # Log stats
         mathfrak_s_1, mathfrak_s_2 = 0.0, 0.0
@@ -200,6 +201,9 @@ def main(cfg: DictConfig) -> None:
                 if train_dataset[sample_id][1] == -1:
                     mathfrak_s_2 += dict_attention_scores["cumulative_attention"][-1]
 
+        train_accuracy, train_loss = calc_accuracy_and_loss(model, train_loader, device)
+        test_accuracy, test_loss = calc_accuracy_and_loss(model, test_loader, device)
+
         p_norm = torch.norm(model.p).item()
         alignment_vmu_1 = model.p.squeeze()[0].item() / p_norm
         alignment_vmu_2 = model.p.squeeze()[1].item() / p_norm
@@ -208,6 +212,8 @@ def main(cfg: DictConfig) -> None:
         dict_stats_time_step["loss"].append(loss.item())
         dict_stats_time_step["train_accuracy"].append(train_accuracy)
         dict_stats_time_step["test_accuracy"].append(test_accuracy)
+        dict_stats_time_step["train_loss"].append(train_loss)
+        dict_stats_time_step["test_loss"].append(test_loss)
         dict_stats_time_step["mathfrak_s_1"].append(mathfrak_s_1)
         dict_stats_time_step["mathfrak_s_2"].append(mathfrak_s_2)
         dict_stats_time_step["alignment_vmu_1"].append(alignment_vmu_1)
@@ -218,6 +224,8 @@ def main(cfg: DictConfig) -> None:
                 "loss": loss.item(),
                 "train_accuracy": train_accuracy,
                 "test_accuracy": test_accuracy,
+                "train_loss": train_loss,
+                "test_loss": test_loss,
                 "mathfrak_s_1": mathfrak_s_1,
                 "mathfrak_s_2": mathfrak_s_2,
                 "alignment_vmu_1": alignment_vmu_1,
