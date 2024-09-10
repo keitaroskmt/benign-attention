@@ -42,21 +42,21 @@ class CustomDataset(Dataset):
         self.data[:, 2, :] = self.data[:, 2, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_2, vmu_1)
         # Create noisy data
         noisy_data_size = int(np.ceil(num_samples * noise_ratio))
-        self.noisy_data_mask = torch.zeros(num_samples, dtype=torch.bool)
-        self.noisy_data_mask[:noisy_data_size] = True
-        self.noisy_data_mask = self.noisy_data_mask[torch.randperm(num_samples)]
+        self._noisy_data_mask = torch.zeros(num_samples, dtype=torch.bool)
+        self._noisy_data_mask[:noisy_data_size] = True
+        self._noisy_data_mask = self._noisy_data_mask[torch.randperm(num_samples)]
         assert noisy_data_size > 0 if noise_ratio > 0.0 else noisy_data_size == 0
-        self.label = torch.where(self.noisy_data_mask, -self.label, self.label)
+        self.label = torch.where(self._noisy_data_mask, -self.label, self.label)
 
     def __len__(self) -> int:
-        return self.num_samples
+        return self._num_samples
 
     def __getitem__(self, idx: int) -> Tensor:
         return self.data[idx], self.label[idx]
 
     @property
     def noisy_data_mask(self) -> int:
-        return self.noisy_data_mask
+        return self._noisy_data_mask
 
 
 class Attention(nn.Module):
@@ -201,8 +201,8 @@ def main(cfg: DictConfig) -> None:
                     mathfrak_s_2 += dict_attention_scores["cumulative_attention"][-1]
 
         p_norm = torch.norm(model.p).item()
-        alignment_vmu_1 = model.p.squeeze()[0].item / p_norm
-        alignment_vmu_2 = model.p.squeeze()[1].item / p_norm
+        alignment_vmu_1 = model.p.squeeze()[0].item() / p_norm
+        alignment_vmu_2 = model.p.squeeze()[1].item() / p_norm
 
         dict_stats_time_step["time_step"].append(time_step)
         dict_stats_time_step["loss"].append(loss.item())
