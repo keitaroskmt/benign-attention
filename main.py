@@ -116,8 +116,8 @@ def calc_accuracy_and_loss(model: nn.Module, loader: DataLoader, device: torch.d
 
 @hydra.main(config_path="config", config_name="main", version_base=None)
 def main(cfg: DictConfig) -> None:
-    wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     wandb.init(project="benign_overfitting_attention")
+    wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
 
     # Same scale for the linear head as in the paper
     nu_norm = 1 / cfg["signal_norm"]
