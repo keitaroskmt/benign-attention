@@ -163,6 +163,7 @@ cython_debug/
 
 wandb/
 outputs/
+multirun/
 *.csv
 *.out
 job.sh

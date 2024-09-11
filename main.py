@@ -242,6 +242,8 @@ def main(cfg: DictConfig) -> None:
         os.path.join(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "stats_time_step.csv"), index=False
     )
 
+    wandb.finish()
+
 
 if __name__ == "__main__":
     main()
