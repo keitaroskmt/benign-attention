@@ -86,11 +86,11 @@ class Attention(nn.Module):
             embed_dim == self.embed_dim
         ), f"Input embedding dimension {embed_dim} must match layer embedding dimension {self.embed_dim}"
 
-        attention_logits = (x @ self.W @ self.p).squeeze()
+        attention_logits = (x @ self.W @ self.p).squeeze(-1)
         attention_scores = torch.softmax(attention_logits, dim=-1)
 
-        token_scores = (x @ self.nu).squeeze()
-        output = torch.sum(attention_scores * token_scores, dim=1).squeeze()
+        token_scores = (x @ self.nu).squeeze(-1)
+        output = torch.sum(attention_scores * token_scores, dim=1)
         assert output.size() == (batch_size,), f"Output size {output.size()} must be equal to {(batch_size,)}"
         return output, attention_scores
 
