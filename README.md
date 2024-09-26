@@ -15,6 +15,11 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+If you are first to [Weights & Biases](https://wandb.ai/site), please login:
+```bash
+wandb login
+```
+
 ### Training
 To train the model in the same setting as our paper, run this command:
 ```python
