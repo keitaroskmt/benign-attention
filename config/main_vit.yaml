@@ -1,0 +1,20 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - _self_
+
+seed: 1
+patch_size: 4
+dim: 128
+depth: 6
+heads: 6
+mlp_dim: 256
+dropout: 0.1
+emb_dropout: 0.1
+
+num_epochs: 200
+batch_size: 128
+learning_rate: 1e-4
+noise_ratio: 0.2
