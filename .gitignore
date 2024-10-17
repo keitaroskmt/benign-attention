@@ -166,4 +166,4 @@ outputs/
 multirun/
 *.csv
 *.out
-job.sh
+job*.sh
