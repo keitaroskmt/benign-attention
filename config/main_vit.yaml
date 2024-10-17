@@ -6,6 +6,7 @@ defaults:
   - _self_
 
 seed: 1
+use_ddp: true
 patch_size: 4
 dim: 128
 depth: 6
