@@ -2,10 +2,11 @@ import os
 import logging
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader
 
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
@@ -18,17 +19,22 @@ from src.datasets.cifar import get_cifar10_datasets
 from src.distributed_utils import setup, cleanup
 
 
-def calc_accuracy(
-    model: nn.Module, loader: DataLoader, device: torch.device | str
-) -> float:
+def evaluate(
+    model: nn.Module, loader: DataLoader, device: torch.device | str | int
+) -> tuple[Tensor, Tensor]:
+    """
+    Calculate the number of correct predictions and the total number of samples.
+    """
     model.eval()
-    correct = 0
+    correct = torch.tensor(0, device=device)
+    total = torch.tensor(0, device=device)
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
             pred = model(data)
-            correct += pred.argmax(dim=1).eq(target).sum().item()
-    return correct / len(loader.dataset)
+            correct += pred.argmax(dim=1).eq(target).sum()
+            total += len(target)
+    return correct, total
 
 
 @hydra.main(config_path="config", config_name="main_vit", version_base=None)
@@ -67,21 +73,24 @@ def main(cfg: DictConfig) -> None:
 
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
-        setup(rank=int(os.environ["RANK"]), world_size=int(os.environ["WORLD_SIZE"]))
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
+
+        setup(rank, world_size)
 
         model = model.to(local_rank)
         model = DDP(model, device_ids=[local_rank])
 
         train_sampler = DistributedSampler(
             train_dataset,
-            num_replicas=cfg["world_size"],
+            num_replicas=world_size,
             rank=local_rank,
             drop_last=True,
         )
         test_sampler = DistributedSampler(
             test_dataset,
-            num_replicas=cfg["world_size"],
+            num_replicas=world_size,
             rank=local_rank,
             drop_last=True,
         )
@@ -115,7 +124,7 @@ def main(cfg: DictConfig) -> None:
         for data, target in train_loader:
             optimizer.zero_grad()
             if cfg["use_ddp"]:
-                data, target = data.to(cfg["rank"]), target.to(cfg["rank"])
+                data, target = data.to(local_rank), target.to(local_rank)
             else:
                 data, target = data.to(device), target.to(device)
             logits = model(data)
@@ -123,8 +132,23 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             optimizer.step()
 
-        train_acc = calc_accuracy(model, train_loader, device)
-        test_acc = calc_accuracy(model, test_loader, device)
+        sum_train_corrects, sum_train_total = evaluate(
+            model, train_loader, local_rank if cfg["use_ddp"] else device
+        )
+        sum_test_corrects, sum_test_total = evaluate(
+            model, test_loader, local_rank if cfg["use_ddp"] else device
+        )
+        if cfg["use_ddp"]:
+            dist.barrier()
+            dist.reduce(sum_train_corrects, dst=0)
+            dist.reduce(sum_train_total, dst=0)
+            dist.reduce(sum_test_corrects, dst=0)
+            dist.reduce(sum_test_total, dst=0)
+        train_acc = sum_train_corrects.item() / sum_train_total.item()
+        test_acc = sum_test_corrects.item() / sum_test_total.item()
+
+        if cfg["use_ddp"] and dist.get_rank() != 0:
+            continue
         logger.info({"epoch": epoch, "train_acc": train_acc, "test_acc": test_acc})
         wandb.log({"train_acc": train_acc, "test_acc": test_acc})
 
