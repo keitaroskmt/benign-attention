@@ -1,5 +1,5 @@
 ## Benign or Not-Benign Overfitting in Token Selection of Attention Mechanism
-This repository is the official implementation of [Benign or Not-Benign Overfitting in Token Selection of Attention Mechanism]()
+This repository is the official implementation of [Benign or Not-Benign Overfitting in Token Selection of Attention Mechanism](https://arxiv.org/abs/2409.17625)
 
 ### Requirements
 - Python
@@ -13,6 +13,11 @@ source venv/bin/activate
 
 # Install requirements
 pip install -r requirements.txt
+```
+
+If you are first to [Weights & Biases](https://wandb.ai/site), please login:
+```bash
+wandb login
 ```
 
 ### Training
@@ -36,4 +41,10 @@ For some of the figures, you need to run the main file with `multirun` option.
 ### Citation
 If you find our work useful for your research, please cite using this BibTeX:
 ```BibTeX
+@article{sakamoto2024benign,
+      title={Benign or not-benign overfitting in token selection of attention mechanism}, 
+      author={Sakamoto, Keitaro and Sato, Issei},
+      journal={arXiv preprint arXiv:2409.17625},
+      year={2024}
+}
 ```
