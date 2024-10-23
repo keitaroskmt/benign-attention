@@ -8,7 +8,7 @@ defaults:
 seed: 1
 use_ddp: true
 patch_size: 4
-dim: 128
+dim: 256
 depth: 6
 heads: 6
 mlp_dim: 256
@@ -17,5 +17,5 @@ emb_dropout: 0.1
 
 num_epochs: 200
 batch_size: 128
-learning_rate: 1e-4
+learning_rate: 1e-3
 noise_ratio: 0.2

@@ -167,3 +167,4 @@ multirun/
 *.csv
 *.out
 job*.sh
+*.err
