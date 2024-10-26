@@ -1,0 +1,15 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - _self_
+
+seed: 1
+dataset: cifar10
+patch_size: 4
+batch_size: 128
+dim: 512
+use_ddp: true
+num_epochs: 100
+learning_rate: 1e-4
