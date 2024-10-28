@@ -4,6 +4,7 @@ import logging
 import torch
 from torch import nn, Tensor
 from torch.optim.sgd import SGD
+from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
 from torch.nn.init import zeros_, orthogonal_, uniform_
 from torch.nn.parameter import Parameter
@@ -14,10 +15,9 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from transformers import get_cosine_schedule_with_warmup
 
-from src.models.vit import ViT
 from src.datasets.cifar import get_cifar10_datasets
 from src.distributed_utils import setup, cleanup
 
@@ -101,25 +101,25 @@ class OurAttention(nn.Module):
         raise NotImplementedError()
 
 
-class OurViT(nn.Module):
+class OurModel(nn.Module):
     def __init__(
         self,
         *,
-        image_size: int,
+        size: int,
         patch_size: int,
         num_classes: int,
         dim: int,
         channels: int = 3,
     ):
         super().__init__()
-        image_height, image_width = image_size, image_size
+        height, width = size, size
         patch_height, patch_width = patch_size, patch_size
 
         assert (
-            image_height % patch_height == 0 and image_width % patch_width == 0
-        ), "Image dimensions must be divisible by the patch size."
+            height % patch_height == 0 and width % patch_width == 0
+        ), "Dimensions must be divisible by the patch size."
 
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        num_patches = (height // patch_height) * (width // patch_width)
         patch_dim = channels * patch_height * patch_width
 
         self.to_patch_embedding = nn.Sequential(
@@ -137,7 +137,7 @@ class OurViT(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: Input tensor of shape (batch_size, channels, image_height, image_width).
+            x: Input tensor of shape (batch_size, channels, height, width).
         """
         x = self.to_patch_embedding(x)
         return self.attention(x)
@@ -151,19 +151,16 @@ def main(cfg: DictConfig) -> None:
     seed = cfg["seed"]
     torch.manual_seed(seed)
 
-    dataset_name = cfg["dataset"]
-
+    dataset_name = cfg["dataset"]["name"]
     if dataset_name == "cifar10":
         train_dataset, test_dataset = get_cifar10_datasets()
-        image_size = 32
-        num_classes = 10
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    model = OurViT(
-        image_size=image_size,
+    model = OurModel(
+        size=cfg["dataset"]["size"],
         patch_size=cfg["patch_size"],
-        num_classes=num_classes,
+        num_classes=cfg["dataset"]["batch_size"],
         dim=cfg["dim"],
     )
 
@@ -201,22 +198,42 @@ def main(cfg: DictConfig) -> None:
         )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg["batch_size"],
+        batch_size=cfg["dataset"]["batch_size"],
         sampler=train_sampler,
         num_workers=4,
         pin_memory=True,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=cfg["batch_size"],
+        batch_size=cfg["dataset"]["batch_size"],
         sampler=test_sampler,
         num_workers=4,
         pin_memory=True,
     )
 
-    optimizer = SGD(model.parameters(), lr=cfg["learning_rate"])
+    if cfg["optimizer"]["name"] == "sgd":
+        optimizer = SGD(
+            model.parameters(),
+            lr=cfg["optimizer"]["learning_rate"],
+            momentum=cfg["optimizer"]["momentum"],
+            weight_decay=cfg["optimizer"]["weight_decay"],
+        )
+    elif cfg["optimizer"]["name"] == "adamw":
+        optimizer = AdamW(
+            model.parameters(),
+            lr=cfg["optimizer"]["learning_rate"],
+            weight_decay=cfg["optimizer"]["weight_decay"],
+        )
+    else:
+        raise NotImplementedError(
+            f"Optimizer {cfg['optimizer']['name']} is not supported."
+        )
 
-    # TODO: (keitaroskmt) use lr scheduler?
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=len(train_loader) * cfg["warmup_epochs"],
+        num_training_steps=len(train_loader) * cfg["num_epochs"],
+    )
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -233,6 +250,7 @@ def main(cfg: DictConfig) -> None:
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
+        scheduler.step()
 
         sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
         sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)
