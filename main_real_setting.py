@@ -145,8 +145,8 @@ class OurModel(nn.Module):
 
 @hydra.main(config_path="config", config_name="main_real_setting", version_base=None)
 def main(cfg: DictConfig) -> None:
-    wandb.init(project="benign_attention_real_setting")
-    wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb.init(project="benign_attention_real_setting", config=wandb_config)
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
