@@ -19,6 +19,7 @@ from einops.layers.torch import Rearrange
 from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.cifar import get_cifar10_datasets
+from src.datasets.glue import get_glue_datasets
 from src.distributed_utils import setup, cleanup
 
 
@@ -101,7 +102,7 @@ class OurAttention(nn.Module):
         raise NotImplementedError()
 
 
-class OurModel(nn.Module):
+class ToyVisionTransformer(nn.Module):
     def __init__(
         self,
         *,
@@ -143,6 +144,30 @@ class OurModel(nn.Module):
         return self.attention(x)
 
 
+class ToyTextTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_classes: int,
+        vocab_size: int,
+        dim: int,
+    ):
+        super().__init__()
+
+        self.embedding_layer = nn.Embedding(
+            num_embeddings=vocab_size, embedding_dim=dim
+        )
+        self.attention = OurAttention(dim, num_classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_len).
+        """
+        x = self.embedding_layer(x)
+        return self.attention(x)
+
+
 @hydra.main(config_path="config", config_name="main_real_setting", version_base=None)
 def main(cfg: DictConfig) -> None:
     wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
@@ -153,17 +178,24 @@ def main(cfg: DictConfig) -> None:
 
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "cifar10":
+        model = ToyVisionTransformer(
+            size=cfg["dataset"]["size"],
+            patch_size=cfg["patch_size"],
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+        )
         train_dataset, test_dataset = get_cifar10_datasets()
+    elif dataset_name == "sst2":
+        model = ToyTextTransformer(
+            vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+        )
+        train_dataset, _, test_dataset = get_glue_datasets(task_name="sst2")
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    model = OurModel(
-        size=cfg["dataset"]["size"],
-        patch_size=cfg["patch_size"],
-        num_classes=cfg["dataset"]["batch_size"],
-        dim=cfg["dim"],
-    )
-
+    print("passed here")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
