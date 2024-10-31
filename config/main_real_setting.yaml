@@ -11,5 +11,6 @@ seed: 1
 use_ddp: true
 patch_size: 4
 dim: 512
+noise_ratio: 0.0
 warmup_epochs: 10
 num_epochs: 1000

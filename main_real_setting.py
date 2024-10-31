@@ -20,6 +20,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
+from src.datasets.noisy_dataset import NoisyDataset
 from src.distributed_utils import setup, cleanup
 
 
@@ -195,7 +196,6 @@ def main(cfg: DictConfig) -> None:
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    print("passed here")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -204,6 +204,18 @@ def main(cfg: DictConfig) -> None:
         device = "cpu"
     model = model.to(device)
 
+    train_dataset = NoisyDataset(
+        dataset=train_dataset,
+        noise_ratio=cfg["noise_ratio"],
+        key_input=cfg["dataset"]["key_input"],
+        key_target=cfg["dataset"]["key_target"],
+    )
+    test_dataset = NoisyDataset(
+        dataset=test_dataset,
+        noise_ratio=cfg["noise_ratio"],
+        key_input=cfg["dataset"]["key_input"],
+        key_target=cfg["dataset"]["key_target"],
+    )
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
         rank = int(os.environ["RANK"])
