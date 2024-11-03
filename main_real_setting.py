@@ -20,7 +20,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
-from src.datasets.noisy_dataset import NoisyDataset
+from src.datasets.noisy_dataset import collate_fn
 from src.distributed_utils import setup, cleanup
 
 
@@ -34,9 +34,11 @@ def evaluate(
     correct = torch.tensor(0, device=device)
     total = torch.tensor(0, device=device)
     with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            pred = model(data)
+        for input in loader:
+            data, target = input.data.to(device), input.target.to(device)
+            if input.attention_mask is not None:
+                input.attention_mask = input.attention_mask.to(device)
+            pred = model(data, input.attention_mask)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -65,38 +67,49 @@ class OurAttention(nn.Module):
         zeros_(self.p)
         uniform_(self.nu, -1 / self.embed_dim**0.5, 1 / self.embed_dim**0.5)
 
-    def forward_with_scores(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def forward_with_scores(
+        self, x: Tensor, attention_mask: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
         """
         Return the output tensor (batch_size, num_classes) and the attention scores (batch_size, seq_len).
         Args:
             x: Input tensor of shape (batch_size, seq_len, embed_dim).
+            attention_mask: Attention mask tensor of shape (batch_size, seq_len).
+                0 for unmasked, -inf for masked.
         """
         assert x.dim() == 3, f"Input must have 3 dimensions, got {x.dim()}"
         batch_size, seq_len, embed_dim = x.size()
         assert (
             embed_dim == self.embed_dim
         ), f"Input embedding dimension {embed_dim} must match layer embedding dimension {self.embed_dim}"
+        assert (
+            attention_mask is None or attention_mask.size() == (batch_size, seq_len)
+        ), f"Attention mask size {attention_mask.size()} must be equal to {(batch_size, seq_len)}"
 
+        # [batch_size, seq_len]
         attention_logits = (x @ self.W @ self.p).squeeze(-1)
+        if attention_mask is not None:
+            attention_logits = attention_logits + attention_mask
+        # [batch_size, seq_len]
         attention_scores = torch.softmax(attention_logits, dim=-1)
 
-        token_scores = (x @ self.nu).squeeze(-1)
+        # [batch_size, seq_len, num_classes]
+        token_scores = x @ self.nu
         output = torch.sum(attention_scores.unsqueeze(-1) * token_scores, dim=1)
-        assert output.size() == (
-            batch_size,
-            self.num_classes,
-        ), f"Output size {output.size()} must be equal to {(batch_size,)}"
+        assert (
+            output.size() == (batch_size, self.num_classes)
+        ), f"Output size {output.size()} must be equal to {(batch_size, self.num_classes)}"
         assert (
             attention_scores.size() == (batch_size, seq_len)
         ), f"Attention scores size {attention_scores.size()} must be equal to {(batch_size, seq_len)}"
         return output, attention_scores
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         """
         Args:
             x: Input tensor of shape (batch_size, seq_len, embed_dim).
         """
-        return self.forward_with_scores(x)[0]
+        return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
     # TODO: (keitaroskmt) Implement forward with fixed linear head nu
     def forward_with_fixed_head(self, x: Tensor) -> Tensor:
@@ -136,11 +149,13 @@ class ToyVisionTransformer(nn.Module):
         )
         self.attention = OurAttention(dim, num_classes)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         """
         Args:
             x: Input tensor of shape (batch_size, channels, height, width).
         """
+        assert attention_mask is None, "Attention mask is not supported for ViT."
+
         x = self.to_patch_embedding(x)
         return self.attention(x)
 
@@ -160,13 +175,25 @@ class ToyTextTransformer(nn.Module):
         )
         self.attention = OurAttention(dim, num_classes)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         """
         Args:
             x: Input tensor of shape (batch_size, seq_len).
+            attention_mask: Attention mask tensor of shape (batch_size, seq_len).
+                1 for unmasked, 0 for masked.
         """
+        # (batch_size, seq_len) -> (batch_size, seq_len, dim)
         x = self.embedding_layer(x)
-        return self.attention(x)
+
+        if attention_mask is not None:
+            if attention_mask.size() != x.size()[:2]:
+                raise ValueError(
+                    f"Attention mask size {attention_mask.size()} must be equal to {(x.size()[:2])}"
+                )
+            # 0 for unmasked, -inf for masked
+            attention_mask = (1.0 - attention_mask) * torch.finfo(x.dtype).min
+
+        return self.attention(x, attention_mask=attention_mask)
 
 
 @hydra.main(config_path="config", config_name="main_real_setting", version_base=None)
@@ -185,14 +212,18 @@ def main(cfg: DictConfig) -> None:
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
         )
-        train_dataset, test_dataset = get_cifar10_datasets()
+        train_dataset, test_dataset = get_cifar10_datasets(
+            noise_ratio=cfg["noise_ratio"]
+        )
     elif dataset_name == "sst2":
         model = ToyTextTransformer(
             vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
         )
-        train_dataset, _, test_dataset = get_glue_datasets(task_name="sst2")
+        train_dataset, test_dataset, _ = get_glue_datasets(
+            task_name="sst2", noise_ratio=cfg["noise_ratio"]
+        )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
@@ -204,18 +235,6 @@ def main(cfg: DictConfig) -> None:
         device = "cpu"
     model = model.to(device)
 
-    train_dataset = NoisyDataset(
-        dataset=train_dataset,
-        noise_ratio=cfg["noise_ratio"],
-        key_input=cfg["dataset"]["key_input"],
-        key_target=cfg["dataset"]["key_target"],
-    )
-    test_dataset = NoisyDataset(
-        dataset=test_dataset,
-        noise_ratio=cfg["noise_ratio"],
-        key_input=cfg["dataset"]["key_input"],
-        key_target=cfg["dataset"]["key_target"],
-    )
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
         rank = int(os.environ["RANK"])
@@ -244,6 +263,7 @@ def main(cfg: DictConfig) -> None:
         train_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=train_sampler,
+        collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
     )
@@ -251,6 +271,7 @@ def main(cfg: DictConfig) -> None:
         test_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=test_sampler,
+        collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
     )
@@ -287,10 +308,12 @@ def main(cfg: DictConfig) -> None:
         if cfg["use_ddp"]:
             assert train_sampler is not None
             train_sampler.set_epoch(epoch)
-        for data, target in train_loader:
+        for input in train_loader:
             optimizer.zero_grad()
-            data, target = data.to(device), target.to(device)
-            logits = model(data)
+            data, target = input.data.to(device), input.target.to(device)
+            if input.attention_mask is not None:
+                input.attention_mask = input.attention_mask.to(device)
+            logits = model(data, input.attention_mask)
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()

@@ -5,5 +5,3 @@ dataset:
   batch_size: 128
   num_classes: 10
   num_channels: 3
-  key_input: data
-  key_target: targets

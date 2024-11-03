@@ -6,9 +6,10 @@ import contextlib
 
 import torch.distributed as dist
 from torch.utils.data import Dataset
-
 from datasets import load_dataset
 from transformers import AutoTokenizer
+
+from src.datasets.noisy_dataset import NoisyDataset
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ task_to_keys = {
 
 def get_glue_datasets(
     task_name: str = "sst2",
+    noise_ratio: float = 0.0,
     model_name_or_path: str | None = "bert-base-uncased",
     pad_to_max_length: bool = True,
 ) -> tuple[Dataset, Dataset, Dataset]:
@@ -126,6 +128,7 @@ def get_glue_datasets(
         raw_datasets = raw_datasets.map(
             preprocess_function, batched=True, desc="Running tokenizer on dataset"
         )
+        raw_datasets.set_format(type="torch")
 
     train_dataset = raw_datasets["train"]
     valid_dataset = raw_datasets[
@@ -136,5 +139,24 @@ def get_glue_datasets(
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    train_dataset = NoisyDataset(
+        train_dataset,
+        noise_ratio=noise_ratio,
+        key_data="input_ids",
+        key_target="label",
+    )
+    valid_dataset = NoisyDataset(
+        valid_dataset,
+        noise_ratio=noise_ratio,
+        key_data="input_ids",
+        key_target="label",
+    )
+    test_dataset = NoisyDataset(
+        test_dataset,
+        noise_ratio=noise_ratio,
+        key_data="input_ids",
+        key_target="label",
+    )
 
     return train_dataset, valid_dataset, test_dataset
