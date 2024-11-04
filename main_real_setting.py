@@ -20,6 +20,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
+from src.datasets.agnews import get_agnews_datasets
 from src.utils import add_label_noise
 from src.distributed_utils import setup, cleanup
 
@@ -37,7 +38,7 @@ def get_pred_and_target(
     Args:
         model: Model to be used for prediction.
         input: Object from DataLoader.
-        dataset_name: Name of the dataset. "cifar10" or "sst2".
+        dataset_name: Name of the dataset.
         noise_ratio: Label noise ratio of the dataset.
         num_classes: Number of classes in the dataset.
         device: Device where the model is placed.
@@ -48,7 +49,7 @@ def get_pred_and_target(
         data, target = input[0].to(device), input[1].to(device)
         target = add_label_noise(target, noise_ratio, num_classes, device)
         return model(data), target
-    elif dataset_name == "sst2":
+    elif dataset_name == "sst2" or dataset_name == "agnews":
         data = input["input_ids"].to(device)
         target = input["label"].to(device)
         attention_mask = (
@@ -268,6 +269,13 @@ def main(cfg: DictConfig) -> None:
             dim=cfg["dim"],
         )
         train_dataset, test_dataset, _ = get_glue_datasets(task_name="sst2")
+    elif dataset_name == "agnews":
+        model = ToyTextTransformer(
+            vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+        )
+        train_dataset, test_dataset = get_agnews_datasets()
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
