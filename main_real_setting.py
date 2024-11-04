@@ -20,12 +20,53 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
-from src.datasets.noisy_dataset import collate_fn
+from src.utils import add_label_noise
 from src.distributed_utils import setup, cleanup
 
 
+def get_pred_and_target(
+    model: nn.Module,
+    input,
+    dataset_name: str,
+    noise_ratio: float,
+    num_classes: int,
+    device: torch.device | str | int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Get the prediction tensor from the model.
+    Args:
+        model: Model to be used for prediction.
+        input: Object from DataLoader.
+        dataset_name: Name of the dataset. "cifar10" or "sst2".
+        noise_ratio: Label noise ratio of the dataset.
+        num_classes: Number of classes in the dataset.
+        device: Device where the model is placed.
+    Returns:
+        tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
+    """
+    if dataset_name == "cifar10":
+        data, target = input[0].to(device), input[1].to(device)
+        target = add_label_noise(target, noise_ratio, num_classes, device)
+        return model(data), target
+    elif dataset_name == "sst2":
+        data = input["input_ids"].to(device)
+        target = input["label"].to(device)
+        attention_mask = (
+            input["attention_mask"].to(device) if "attention_mask" in input else None
+        )
+        target = add_label_noise(target, noise_ratio, num_classes, device)
+        return model(data, attention_mask=attention_mask), target
+    else:
+        raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
+
+
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device | str | int
+    model: nn.Module,
+    loader: DataLoader,
+    dataset_name: str,
+    noise_ratio: float,
+    num_classes: int,
+    device: torch.device | str | int,
 ) -> tuple[Tensor, Tensor]:
     """
     Calculate the number of correct predictions and the total number of samples.
@@ -35,10 +76,9 @@ def evaluate(
     total = torch.tensor(0, device=device)
     with torch.no_grad():
         for input in loader:
-            data, target = input.data.to(device), input.target.to(device)
-            if input.attention_mask is not None:
-                input.attention_mask = input.attention_mask.to(device)
-            pred = model(data, input.attention_mask)
+            pred, target = get_pred_and_target(
+                model, input, dataset_name, noise_ratio, num_classes, device
+            )
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -204,6 +244,12 @@ def main(cfg: DictConfig) -> None:
     seed = cfg["seed"]
     torch.manual_seed(seed)
 
+    if cfg["use_ddp"]:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        setup(rank, world_size)
+
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "cifar10":
         model = ToyVisionTransformer(
@@ -221,9 +267,7 @@ def main(cfg: DictConfig) -> None:
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
         )
-        train_dataset, test_dataset, _ = get_glue_datasets(
-            task_name="sst2", noise_ratio=cfg["noise_ratio"]
-        )
+        train_dataset, test_dataset, _ = get_glue_datasets(task_name="sst2")
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
@@ -237,16 +281,9 @@ def main(cfg: DictConfig) -> None:
 
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
         device = local_rank
-
-        setup(rank, world_size)
-
         model = model.to(local_rank)
         model = DDP(model, device_ids=[local_rank])
-
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -263,7 +300,6 @@ def main(cfg: DictConfig) -> None:
         train_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=train_sampler,
-        collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
     )
@@ -271,7 +307,6 @@ def main(cfg: DictConfig) -> None:
         test_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=test_sampler,
-        collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
     )
@@ -302,6 +337,7 @@ def main(cfg: DictConfig) -> None:
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
+    logger.info(f"Config: {cfg}")
 
     model.train()
     for epoch in range(cfg["num_epochs"]):
@@ -310,17 +346,35 @@ def main(cfg: DictConfig) -> None:
             train_sampler.set_epoch(epoch)
         for input in train_loader:
             optimizer.zero_grad()
-            data, target = input.data.to(device), input.target.to(device)
-            if input.attention_mask is not None:
-                input.attention_mask = input.attention_mask.to(device)
-            logits = model(data, input.attention_mask)
+            logits, target = get_pred_and_target(
+                model,
+                input,
+                dataset_name,
+                cfg["noise_ratio"],
+                cfg["dataset"]["num_classes"],
+                device,
+            )
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
         scheduler.step()
 
-        sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
-        sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)
+        sum_train_corrects, sum_train_total = evaluate(
+            model,
+            train_loader,
+            dataset_name,
+            cfg["noise_ratio"],
+            cfg["dataset"]["num_classes"],
+            device,
+        )
+        sum_test_corrects, sum_test_total = evaluate(
+            model,
+            test_loader,
+            dataset_name,
+            cfg["noise_ratio"],
+            cfg["dataset"]["num_classes"],
+            device,
+        )
         if cfg["use_ddp"]:
             dist.barrier()
             dist.all_reduce(sum_train_corrects)
