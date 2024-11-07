@@ -4,7 +4,7 @@ from torchvision.datasets import CIFAR10
 
 
 def get_cifar10_datasets(
-    noise_ratio: float = 0.0, size: int = 32, root: str = "~/pytorch_datasets"
+    size: int = 32, root: str = "~/pytorch_datasets"
 ) -> tuple[Dataset, Dataset]:
     mean, std = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
 
