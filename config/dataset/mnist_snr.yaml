@@ -1,0 +1,8 @@
+# @package _global_
+dataset:
+  name: mnist_snr
+  size: 28
+  batch_size: 128
+  num_classes: 10
+  num_channels: 1
+  signal_noise_ratio: 1.0

@@ -21,6 +21,7 @@ from transformers import get_cosine_schedule_with_warmup
 from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
 from src.datasets.agnews import get_agnews_datasets
+from src.datasets.mnist import get_mnist_snr_datasets
 from src.utils import add_label_noise
 from src.distributed_utils import setup, cleanup
 
@@ -45,7 +46,7 @@ def get_pred_and_target(
     Returns:
         tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
     """
-    if dataset_name == "cifar10":
+    if dataset_name == "cifar10" or dataset_name == "mnist_snr":
         data, target = input[0].to(device), input[1].to(device)
         target = add_label_noise(target, noise_ratio, num_classes, device)
         return model(data), target
@@ -258,10 +259,9 @@ def main(cfg: DictConfig) -> None:
             patch_size=cfg["patch_size"],
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
+            channels=cfg["dataset"]["num_channels"],
         )
-        train_dataset, test_dataset = get_cifar10_datasets(
-            noise_ratio=cfg["noise_ratio"]
-        )
+        train_dataset, test_dataset = get_cifar10_datasets()
     elif dataset_name == "sst2":
         model = ToyTextTransformer(
             vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
@@ -276,6 +276,17 @@ def main(cfg: DictConfig) -> None:
             dim=cfg["dim"],
         )
         train_dataset, test_dataset = get_agnews_datasets()
+    elif dataset_name == "mnist_snr":
+        model = ToyVisionTransformer(
+            size=cfg["dataset"]["size"],
+            patch_size=cfg["patch_size"],
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+            channels=cfg["dataset"]["num_channels"],
+        )
+        train_dataset, test_dataset = get_mnist_snr_datasets(
+            snr=cfg["dataset"]["signal_noise_ratio"]
+        )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
