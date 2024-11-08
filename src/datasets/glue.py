@@ -6,6 +6,7 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 
 from src.distributed_utils import main_process_first
+from src.datasets.utils import add_label_noise
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ task_to_keys = {
 
 
 def get_glue_datasets(
+    noise_ratio: float = 0.0,
     task_name: str = "sst2",
     model_name_or_path: str | None = "bert-base-uncased",
     pad_to_max_length: bool = True,
@@ -84,6 +86,18 @@ def get_glue_datasets(
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):
+        logger.info(f"Number of classes in the dataset: {num_labels}.")
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    # https://github.com/huggingface/datasets/issues/4684#issuecomment-1185696240
+    if noise_ratio > 0.0:
+        train_dataset = train_dataset.map(
+            lambda example: {
+                "label": add_label_noise(
+                    example["label"], noise_ratio, num_classes=num_labels
+                )
+            },
+            features=train_dataset.features,
+        )
 
     return train_dataset, valid_dataset, test_dataset

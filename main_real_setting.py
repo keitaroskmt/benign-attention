@@ -23,7 +23,6 @@ from src.datasets.cifar import get_cifar10_datasets
 from src.datasets.glue import get_glue_datasets
 from src.datasets.agnews import get_agnews_datasets
 from src.datasets.mnist import get_mnist_snr_datasets
-from src.utils import add_label_noise
 from src.distributed_utils import setup, cleanup
 
 
@@ -31,8 +30,6 @@ def get_pred_and_target(
     model: nn.Module,
     input,
     dataset_name: str,
-    noise_ratio: float,
-    num_classes: int,
     device: torch.device | str | int,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -41,15 +38,12 @@ def get_pred_and_target(
         model: Model to be used for prediction.
         input: Object from DataLoader.
         dataset_name: Name of the dataset.
-        noise_ratio: Label noise ratio of the dataset.
-        num_classes: Number of classes in the dataset.
         device: Device where the model is placed.
     Returns:
         tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
     """
     if dataset_name == "cifar10" or dataset_name == "mnist_snr":
         data, target = input[0].to(device), input[1].to(device)
-        target = add_label_noise(target, noise_ratio, num_classes, device)
         return model(data), target
     elif dataset_name == "sst2" or dataset_name == "agnews":
         data = input["input_ids"].to(device)
@@ -57,7 +51,6 @@ def get_pred_and_target(
         attention_mask = (
             input["attention_mask"].to(device) if "attention_mask" in input else None
         )
-        target = add_label_noise(target, noise_ratio, num_classes, device)
         return model(data, attention_mask=attention_mask), target
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
@@ -67,8 +60,6 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     dataset_name: str,
-    noise_ratio: float,
-    num_classes: int,
     device: torch.device | str | int,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -79,9 +70,7 @@ def evaluate(
     total = torch.tensor(0, device=device)
     with torch.no_grad():
         for input in loader:
-            pred, target = get_pred_and_target(
-                model, input, dataset_name, noise_ratio, num_classes, device
-            )
+            pred, target = get_pred_and_target(model, input, dataset_name, device)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -262,21 +251,27 @@ def main(cfg: DictConfig) -> None:
             dim=cfg["dim"],
             channels=cfg["dataset"]["num_channels"],
         )
-        train_dataset, test_dataset = get_cifar10_datasets()
+        train_dataset, test_dataset = get_cifar10_datasets(
+            noise_ratio=cfg["noise_ratio"]
+        )
     elif dataset_name == "sst2":
         model = ToyTextTransformer(
             vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
         )
-        train_dataset, test_dataset, _ = get_glue_datasets(task_name="sst2")
+        train_dataset, test_dataset, _ = get_glue_datasets(
+            noise_ratio=cfg["noise_ratio"], task_name="sst2"
+        )
     elif dataset_name == "agnews":
         model = ToyTextTransformer(
             vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
             num_classes=cfg["dataset"]["num_classes"],
             dim=cfg["dim"],
         )
-        train_dataset, test_dataset = get_agnews_datasets()
+        train_dataset, test_dataset = get_agnews_datasets(
+            noise_ratio=cfg["noise_ratio"]
+        )
     elif dataset_name == "mnist_snr":
         model = ToyVisionTransformer(
             size=cfg["dataset"]["size"],
@@ -286,7 +281,7 @@ def main(cfg: DictConfig) -> None:
             channels=cfg["dataset"]["num_channels"],
         )
         train_dataset, test_dataset = get_mnist_snr_datasets(
-            snr=cfg["dataset"]["signal_noise_ratio"]
+            noise_ratio=cfg["noise_ratio"], snr=cfg["dataset"]["signal_noise_ratio"]
         )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
@@ -373,8 +368,6 @@ def main(cfg: DictConfig) -> None:
                 model,
                 input,
                 dataset_name,
-                cfg["noise_ratio"],
-                cfg["dataset"]["num_classes"],
                 device,
             )
             loss = nn.functional.cross_entropy(logits, target)
@@ -386,16 +379,12 @@ def main(cfg: DictConfig) -> None:
             model,
             train_loader,
             dataset_name,
-            cfg["noise_ratio"],
-            cfg["dataset"]["num_classes"],
             device,
         )
         sum_test_corrects, sum_test_total = evaluate(
             model,
             test_loader,
             dataset_name,
-            cfg["noise_ratio"],
-            cfg["dataset"]["num_classes"],
             device,
         )
         if cfg["use_ddp"]:

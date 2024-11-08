@@ -3,11 +3,13 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
+from src.datasets.utils import add_label_noise
+
 
 # Following the experimental setup in the paper:
 # https://openreview.net/attachment?id=pF8btdPVTL_&name=supplementary_material#page=36.36
 def get_mnist_snr_datasets(
-    snr: float = 1.0, root: str = "~/pytorch_datasets"
+    noise_ratio: float = 0.0, snr: float = 1.0, root: str = "~/pytorch_datasets"
 ) -> tuple[Dataset, Dataset]:
     size = 28
 
@@ -28,5 +30,10 @@ def get_mnist_snr_datasets(
 
     train_dataset.data = train_dataset.data * snr + train_noise.reshape(-1, size, size)
     test_dataset.data = test_dataset.data * snr + test_noise.reshape(-1, size, size)
+
+    if noise_ratio > 0.0:
+        train_dataset.targets = add_label_noise(
+            train_dataset.targets, noise_ratio, num_classes=10
+        )
 
     return train_dataset, test_dataset
