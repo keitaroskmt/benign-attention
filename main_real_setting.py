@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 
 import torch
 from torch import nn, Tensor
@@ -358,6 +359,9 @@ def main(cfg: DictConfig) -> None:
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
 
+    train_accs = []
+    test_accs = []
+
     model.train()
     for epoch in range(cfg["num_epochs"]):
         if cfg["use_ddp"]:
@@ -403,10 +407,27 @@ def main(cfg: DictConfig) -> None:
         train_acc = sum_train_corrects.item() / sum_train_total.item()
         test_acc = sum_test_corrects.item() / sum_test_total.item()
 
-        if cfg["use_ddp"] and dist.get_rank() != 0:
-            continue
-        logger.info({"epoch": epoch, "train_acc": train_acc, "test_acc": test_acc})
-        wandb.log({"train_acc": train_acc, "test_acc": test_acc})
+        if (cfg["use_ddp"] and rank == 0) or not cfg["use_ddp"]:
+            logger.info({"epoch": epoch, "train_acc": train_acc, "test_acc": test_acc})
+            wandb.log({"train_acc": train_acc, "test_acc": test_acc})
+            train_accs.append(train_acc)
+            test_accs.append(test_acc)
+
+    if (cfg["use_ddp"] and rank == 0) or not cfg["use_ddp"]:
+        file_name = os.path.join(
+            hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "log.json"
+        )
+        with open(file_name, "w") as f:
+            json.dump({"train_accs": train_accs, "test_accs": test_accs}, f)
+
+        if cfg["save_model"]:
+            torch.save(
+                model.state_dict(),
+                os.path.join(
+                    hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
+                    "last.pth",
+                ),
+            )
 
     if cfg["use_ddp"]:
         cleanup()

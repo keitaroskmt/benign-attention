@@ -14,3 +14,4 @@ dim: 512
 noise_ratio: 0.0
 warmup_epochs: 10
 num_epochs: 1000
+save_model: false
