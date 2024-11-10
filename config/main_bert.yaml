@@ -1,0 +1,17 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - dataset: sst2
+  - optimizer: adamw
+  - _self_
+
+seed: 1
+use_ddp: true
+dim: 512
+noise_ratio: 0.0
+warmup_epochs: 10
+num_epochs: 1000
+save_model: false
+feature_extractor: embedding
