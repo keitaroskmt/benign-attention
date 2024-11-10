@@ -9,16 +9,22 @@ from src.datasets.utils import add_label_noise
 # Following the experimental setup in the paper:
 # https://openreview.net/attachment?id=pF8btdPVTL_&name=supplementary_material#page=36.36
 def get_mnist_snr_datasets(
-    noise_ratio: float = 0.0, snr: float = 1.0, root: str = "~/pytorch_datasets"
+    noise_ratio: float = 0.0,
+    snr: float = 1.0,
+    root: str = "~/pytorch_datasets",
+    use_transform: bool = True,
 ) -> tuple[Dataset, Dataset]:
     size = 28
 
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
-        ]
-    )
+    if use_transform:
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
+            ]
+        )
+    else:
+        assert False, "Transform is required for MNIST-SNR dataset. This is because we add the gaussian noise to the images."
 
     train_dataset = MNIST(root=root, train=True, download=True, transform=transform)
     test_dataset = MNIST(root=root, train=False, download=True, transform=transform)
