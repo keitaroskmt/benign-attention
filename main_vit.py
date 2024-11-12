@@ -2,12 +2,11 @@ import os
 import logging
 import json
 
-import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.nn.parameter import Parameter
 from torch.nn.init import zeros_, orthogonal_, uniform_
 import torch.distributed as dist
@@ -22,21 +21,9 @@ from transformers import (
 )
 from transformers import get_cosine_schedule_with_warmup
 
-from src.datasets.cifar import get_cifar10_datasets
-from src.datasets.mnist import get_mnist_snr_datasets
+from src.datasets.cifar import get_cifar10_hf_datasets
+from src.datasets.mnist import get_mnist_snr_hf_datasets
 from src.distributed_utils import setup, cleanup
-
-
-class CustomDataset(Dataset):
-    def __init__(self, data: Tensor, targets: Tensor):
-        self.data = data
-        self.targets = targets
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.targets[idx]
 
 
 def get_logits(
@@ -151,35 +138,6 @@ class OurAttention(nn.Module):
         return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
 
-def to_tensor(data: list | np.ndarray | torch.Tensor) -> Tensor:
-    if isinstance(data, list):
-        data = torch.tensor(data)
-    elif isinstance(data, np.ndarray):
-        data = torch.from_numpy(data)
-    elif isinstance(data, Tensor):
-        pass
-    else:
-        raise NotImplementedError(f"Type {type(data)} is not supported.")
-    return data
-
-
-def preprocess_dataset(
-    dataset: Dataset,
-    processor: ViTImageProcessor,
-    do_rescale: bool = True,
-) -> CustomDataset:
-    loader = DataLoader(dataset, batch_size=512, pin_memory=True)
-    data = []
-    for inputs, _ in loader:
-        inputs = to_tensor(inputs)
-        inputs = processor(inputs, do_rescale=do_rescale, return_tensors="pt")
-        data.append(inputs["pixel_values"])
-    data = torch.cat(data, dim=0)
-    targets = to_tensor(dataset.targets)
-    assert data.size(0) == targets.size(0)
-    return CustomDataset(data, targets)
-
-
 @hydra.main(config_path="config", config_name="main_vit", version_base=None)
 def main(cfg: DictConfig) -> None:
     if (cfg["use_ddp"] and dist.get_rank() == 0) or not cfg["use_ddp"]:
@@ -200,31 +158,24 @@ def main(cfg: DictConfig) -> None:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        print(rank, world_size, local_rank)
         device = local_rank
         setup(rank, world_size)
 
+    processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "cifar10":
-        train_dataset, test_dataset = get_cifar10_datasets(
-            noise_ratio=cfg["noise_ratio"], use_transform=False
+        train_dataset, test_dataset = get_cifar10_hf_datasets(
+            processor=processor, noise_ratio=cfg["noise_ratio"]
         )
-        do_rescale = True
     elif dataset_name == "mnist_snr":
-        train_dataset, test_dataset = get_mnist_snr_datasets(
+        train_dataset, test_dataset = get_mnist_snr_hf_datasets(
+            processor=processor,
             noise_ratio=cfg["noise_ratio"],
             snr=cfg["dataset"]["signal_noise_ratio"],
         )
-        do_rescale = False
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
-
-    processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
-
-    # NOTE: keeping the output of feature extractor as a dataset is more efficeint to avoid unnecessary forwarding, but the large dataset may not fit in memory.
-    # One option is to write the data to files, but here we pass the feature extractor every time for simplicity.
-    train_dataset = preprocess_dataset(train_dataset, processor, do_rescale=do_rescale)
-    test_dataset = preprocess_dataset(test_dataset, processor, do_rescale=do_rescale)
 
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
@@ -244,17 +195,16 @@ def main(cfg: DictConfig) -> None:
         train_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=train_sampler,
-        # num_workers=4,
+        num_workers=4,
         pin_memory=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=cfg["dataset"]["batch_size"],
         sampler=test_sampler,
-        # num_workers=4,
+        num_workers=4,
         pin_memory=True,
     )
-    print("passed")
 
     pretrained_model = ViTModel.from_pretrained("google/vit-base-patch16-224")
     pretrained_model.to(device)
@@ -295,6 +245,9 @@ def main(cfg: DictConfig) -> None:
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
+    logger.info(
+        f"Hydra output dir: {hydra.core.hydra_config.HydraConfig.get().runtime.output_dir}"
+    )
 
     losses = []
     train_accs = []
