@@ -8,6 +8,8 @@ from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.parameter import Parameter
+from torch.nn.init import zeros_, orthogonal_, uniform_
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -37,8 +39,33 @@ class CustomDataset(Dataset):
         return self.data[idx], self.targets[idx]
 
 
+def get_logits(
+    cfg: DictConfig, pretrained_model: nn.Module, model: nn.Module, data: Tensor
+) -> Tensor:
+    with torch.no_grad():
+        if cfg["feature_extractor"] == "embedding":
+            feature = (
+                pretrained_model(data, output_hidden_states=True, return_dict=True)
+                .hidden_states[0]
+                .detach()
+            )
+        elif cfg["feature_extractor"] == "encoder":
+            feature = pretrained_model(
+                data, return_dict=True
+            ).last_hidden_state.detach()
+        else:
+            raise NotImplementedError(
+                f"Feature extractor {cfg['feature_extractor']} is not supported."
+            )
+    return model(feature)
+
+
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device | str | int
+    cfg: DictConfig,
+    pretrained_model: nn.Module,
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device | str | int,
 ) -> tuple[Tensor, Tensor]:
     """
     Calculate the number of correct predictions and the total number of samples.
@@ -49,7 +76,7 @@ def evaluate(
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
-            pred = model(data)
+            pred = get_logits(cfg, pretrained_model, model, data)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -124,29 +151,6 @@ class OurAttention(nn.Module):
         return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
 
-def prepare_dataloader_sampler(
-    cfg: DictConfig, dataset: Dataset
-) -> tuple[DataLoader, DistributedSampler | None]:
-    sampler = None
-    if cfg["use_ddp"]:
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            drop_last=True,
-        )
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg["dataset"]["batch_size"],
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-    )
-    return loader, sampler
-
-
 def to_tensor(data: list | np.ndarray | torch.Tensor) -> Tensor:
     if isinstance(data, list):
         data = torch.tensor(data)
@@ -160,43 +164,16 @@ def to_tensor(data: list | np.ndarray | torch.Tensor) -> Tensor:
 
 
 def preprocess_dataset(
-    cfg: DictConfig,
     dataset: Dataset,
     processor: ViTImageProcessor,
-    pretrained_model: ViTModel,
-    device: torch.device | str | int,
     do_rescale: bool = True,
 ) -> CustomDataset:
-    loader, _ = prepare_dataloader_sampler(cfg, dataset)
+    loader = DataLoader(dataset, batch_size=512, pin_memory=True)
     data = []
     for inputs, _ in loader:
-        inputs = to_tensor(inputs).to(device)
+        inputs = to_tensor(inputs)
         inputs = processor(inputs, do_rescale=do_rescale, return_tensors="pt")
-        with torch.no_grad():
-            if cfg["feature_extractor"] == "embedding":
-                feature = (
-                    pretrained_model(
-                        inputs["pixel_values"].to(device),
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    .hidden_states[0]
-                    .detach()
-                    .cpu()
-                )
-            elif cfg["feature_extractor"] == "encoder":
-                feature = (
-                    pretrained_model(
-                        inputs["pixel_values"].to(device), return_dict=True
-                    )
-                    .last_hidden_state.detach()
-                    .cpu()
-                )
-            else:
-                raise NotImplementedError(
-                    f"Feature extractor {cfg['feature_extractor']} is not supported."
-                )
-            data.append(feature)
+        data.append(inputs["pixel_values"])
     data = torch.cat(data, dim=0)
     targets = to_tensor(dataset.targets)
     assert data.size(0) == targets.size(0)
@@ -223,6 +200,7 @@ def main(cfg: DictConfig) -> None:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
+        print(rank, world_size, local_rank)
         device = local_rank
         setup(rank, world_size)
 
@@ -242,24 +220,52 @@ def main(cfg: DictConfig) -> None:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
     processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+
+    # NOTE: keeping the output of feature extractor as a dataset is more efficeint to avoid unnecessary forwarding, but the large dataset may not fit in memory.
+    # One option is to write the data to files, but here we pass the feature extractor every time for simplicity.
+    train_dataset = preprocess_dataset(train_dataset, processor, do_rescale=do_rescale)
+    test_dataset = preprocess_dataset(test_dataset, processor, do_rescale=do_rescale)
+
+    train_sampler, test_sampler = None, None
+    if cfg["use_ddp"]:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            drop_last=True,
+        )
+        test_sampler = DistributedSampler(
+            test_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            drop_last=True,
+        )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["dataset"]["batch_size"],
+        sampler=train_sampler,
+        # num_workers=4,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg["dataset"]["batch_size"],
+        sampler=test_sampler,
+        # num_workers=4,
+        pin_memory=True,
+    )
+    print("passed")
+
     pretrained_model = ViTModel.from_pretrained("google/vit-base-patch16-224")
     pretrained_model.to(device)
     # Use only for extracting the features.
     for param in pretrained_model.parameters():
         param.requires_grad = False
 
-    train_dataset = preprocess_dataset(
-        cfg, train_dataset, processor, pretrained_model, device, do_rescale=do_rescale
-    )
-    test_dataset = preprocess_dataset(
-        cfg, test_dataset, processor, pretrained_model, device, do_rescale=do_rescale
-    )
-    train_loader, train_sampler = prepare_dataloader_sampler(cfg, train_dataset)
-    test_loader, _ = prepare_dataloader_sampler(cfg, test_dataset)
-
     model = OurAttention(dim=cfg["dim"], num_classes=cfg["dataset"]["num_classes"])
     model = model.to(device)
     if cfg["use_ddp"]:
+        pretrained_model = DDP(pretrained_model, device_ids=[local_rank])
         model = DDP(model, device_ids=[local_rank])
 
     if cfg["optimizer"]["name"] == "sgd":
@@ -290,6 +296,7 @@ def main(cfg: DictConfig) -> None:
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
 
+    losses = []
     train_accs = []
     test_accs = []
 
@@ -301,14 +308,18 @@ def main(cfg: DictConfig) -> None:
         for data, target in train_loader:
             optimizer.zero_grad()
             data, target = data.to(device), target.to(device)
-            logits = model(data)
+            logits = get_logits(cfg, pretrained_model, model, data)
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
         scheduler.step()
 
-        sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
-        sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)
+        sum_train_corrects, sum_train_total = evaluate(
+            cfg, pretrained_model, model, train_loader, device
+        )
+        sum_test_corrects, sum_test_total = evaluate(
+            cfg, pretrained_model, model, test_loader, device
+        )
         if cfg["use_ddp"]:
             dist.barrier()
             dist.all_reduce(sum_train_corrects)
@@ -319,8 +330,18 @@ def main(cfg: DictConfig) -> None:
         test_acc = sum_test_corrects.item() / sum_test_total.item()
 
         if (cfg["use_ddp"] and rank == 0) or not cfg["use_ddp"]:
-            logger.info({"epoch": epoch, "train_acc": train_acc, "test_acc": test_acc})
-            wandb.log({"train_acc": train_acc, "test_acc": test_acc})
+            logger.info(
+                {
+                    "epoch": epoch,
+                    "loss": loss.item(),
+                    "train_acc": train_acc,
+                    "test_acc": test_acc,
+                }
+            )
+            wandb.log(
+                {"loss": loss.item(), "train_acc": train_acc, "test_acc": test_acc}
+            )
+            losses.append(loss.item())
             train_accs.append(train_acc)
             test_accs.append(test_acc)
 
@@ -329,7 +350,9 @@ def main(cfg: DictConfig) -> None:
             hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "log.json"
         )
         with open(file_name, "w") as f:
-            json.dump({"train_accs": train_accs, "test_accs": test_accs}, f)
+            json.dump(
+                {"losses": losses, "train_accs": train_accs, "test_accs": test_accs}, f
+            )
 
         if cfg["save_model"]:
             torch.save(

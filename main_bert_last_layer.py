@@ -1,14 +1,14 @@
 import os
 import logging
 import json
+import math
 
 import torch
 from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
-from torch.nn.init import zeros_, orthogonal_, uniform_
-from torch.nn.parameter import Parameter
+from torch.nn.init import zeros_, orthogonal_, uniform_, kaiming_uniform_, ones_
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -16,7 +16,7 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import BertModel
+from transformers import BertForSequenceClassification, BertModel
 from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.glue import get_glue_datasets
@@ -24,7 +24,7 @@ from src.datasets.agnews import get_agnews_datasets
 from src.distributed_utils import setup, cleanup
 
 
-def get_pred_and_target(
+def get_loss_and_logits(
     model: nn.Module,
     input,
     device: torch.device | str | int,
@@ -36,14 +36,17 @@ def get_pred_and_target(
         input: Object from DataLoader.
         device: Device where the model is placed.
     Returns:
-        tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
+        tuple of loss and logits
     """
-    data = input["input_ids"].to(device)
-    target = input["label"].to(device)
     attention_mask = (
         input["attention_mask"].to(device) if "attention_mask" in input else None
     )
-    return model(data, attention_mask=attention_mask), target
+    output = model(
+        input["input_ids"].to(device),
+        attention_mask=attention_mask,
+        labels=input["label"].to(device),
+    )
+    return output.loss, output.logits
 
 
 def evaluate(
@@ -59,79 +62,11 @@ def evaluate(
     total = torch.tensor(0, device=device)
     with torch.no_grad():
         for input in loader:
-            pred, target = get_pred_and_target(model, input, device)
+            target = input["label"].to(device)
+            _, pred = get_loss_and_logits(model, input, device)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
-
-
-class OurAttention(nn.Module):
-    """
-    Attention model in the setting of our paper.
-    """
-
-    def __init__(
-        self, dim: int, num_classes: int, embed_dim: int = 768, device=None, dtype=None
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-
-        self.dim = dim
-        self.num_classes = num_classes
-        self.embed_dim = embed_dim
-        self.W = Parameter(torch.empty(embed_dim, dim, **factory_kwargs))
-        self.p = Parameter(torch.empty(dim, 1, **factory_kwargs))
-        self.nu = Parameter(torch.empty(embed_dim, num_classes, **factory_kwargs))
-        self._reset_parameters()
-
-    def _reset_parameters(self) -> None:
-        orthogonal_(self.W)
-        zeros_(self.p)
-        uniform_(self.nu, -1 / self.dim**0.5, 1 / self.dim**0.5)
-
-    def forward_with_scores(
-        self, x: Tensor, attention_mask: Tensor | None = None
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Return the output tensor (batch_size, num_classes) and the attention scores (batch_size, seq_len).
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, embed_dim).
-            attention_mask: Attention mask tensor of shape (batch_size, seq_len).
-                0 for unmasked, -inf for masked.
-        """
-        assert x.dim() == 3, f"Input must have 3 dimensions, got {x.dim()}"
-        batch_size, seq_len, embed_dim = x.size()
-        assert (
-            embed_dim == self.embed_dim
-        ), f"Input embedding dimension {embed_dim} must match layer embedding dimension {self.embed_dim}"
-        assert (
-            attention_mask is None or attention_mask.size() == (batch_size, seq_len)
-        ), f"Attention mask size {attention_mask.size()} must be equal to {(batch_size, seq_len)}"
-
-        # [batch_size, seq_len]
-        attention_logits = (x @ self.W @ self.p).squeeze(-1)
-        if attention_mask is not None:
-            attention_logits = attention_logits + attention_mask
-        # [batch_size, seq_len]
-        attention_scores = torch.softmax(attention_logits, dim=-1)
-
-        # [batch_size, seq_len, num_classes]
-        token_scores = x @ self.nu
-        output = torch.sum(attention_scores.unsqueeze(-1) * token_scores, dim=1)
-        assert (
-            output.size() == (batch_size, self.num_classes)
-        ), f"Output size {output.size()} must be equal to {(batch_size, self.num_classes)}"
-        assert (
-            attention_scores.size() == (batch_size, seq_len)
-        ), f"Attention scores size {attention_scores.size()} must be equal to {(batch_size, seq_len)}"
-        return output, attention_scores
-
-    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
-        """
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, embed_dim).
-        """
-        return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
 
 @hydra.main(config_path="config", config_name="main_bert", version_base=None)
@@ -168,54 +103,33 @@ def main(cfg: DictConfig) -> None:
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    pretrained_model = BertModel.from_pretrained("bert-base-uncased")
-    pretrained_model = pretrained_model.to(device)
-    # Use only for extracting the features.
-    for param in pretrained_model.parameters():
-        param.requires_grad = False
-
-    # preprocess the dataset
-    if cfg["feature_extractor"] == "embedding":
-
-        def preprocess_function(examples):
-            with torch.no_grad():
-                examples["input_ids"] = (
-                    pretrained_model(
-                        examples["input_ids"].to(device),
-                        attention_mask=examples["attention_mask"].to(device),
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    .hidden_states[0]
-                    .detach()
-                    .cpu()
-                )
-            return examples
-
-    elif cfg["feature_extractor"] == "encoder":
-
-        def preprocess_function(examples):
-            with torch.no_grad():
-                examples["input_ids"] = (
-                    pretrained_model(
-                        examples["input_ids"].to(device),
-                        attention_mask=examples["attention_mask"].to(device),
-                        return_dict=True,
-                    )
-                    .last_hidden_state.detach()
-                    .cpu()
-                )
-            return examples
-    else:
-        raise NotImplementedError(
-            f"Feature extractor {cfg['feature_extractor']} is not supported."
-        )
-
-    train_dataset = train_dataset.map(preprocess_function, batched=True)
-    test_dataset = test_dataset.map(preprocess_function, batched=True)
-
-    model = OurAttention(dim=cfg["dim"], num_classes=cfg["dataset"]["num_classes"])
+    model = BertForSequenceClassification.from_pretrained("bert-base-uncased")
     model = model.to(device)
+    model.num_labels = cfg["dataset"]["num_classes"]
+
+    # Freeze all layers except the last layer and initialize the last layer.
+    for name, param in model.named_parameters():
+        if name.startswith("encoder.layer.11"):
+            pass
+            # if "LayerNorm.weight" in name:
+            #     ones_(param)
+            # elif "LayerNorm.bias" in name:
+            #     zeros_(param)
+            # elif "weight" in name:
+            #     kaiming_uniform_(param, a=math.sqrt(5))
+            # elif "bias" in name:
+            #     if name == "encoder.layer.11.output.dense.bias":
+            #         uniform_(param, -1 / math.sqrt(3072), 1 / math.sqrt(3072))
+            #     else:
+            #         uniform_(param, -1 / math.sqrt(768), 1 / math.sqrt(768))
+        elif name.startswith("pooler") or name.startswith("classifier"):
+            pass
+            # if "weight" in name:
+            #     kaiming_uniform_(param, a=math.sqrt(5))
+            # elif "bias" in name:
+            #     uniform_(param, -1 / math.sqrt(768), 1 / math.sqrt(768))
+        else:
+            param.requires_grad = False
 
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
@@ -286,12 +200,7 @@ def main(cfg: DictConfig) -> None:
             train_sampler.set_epoch(epoch)
         for input in train_loader:
             optimizer.zero_grad()
-            logits, target = get_pred_and_target(
-                model,
-                input,
-                device,
-            )
-            loss = nn.functional.cross_entropy(logits, target)
+            loss, _ = get_loss_and_logits(model, input, device)
             loss.backward()
             optimizer.step()
         scheduler.step()
