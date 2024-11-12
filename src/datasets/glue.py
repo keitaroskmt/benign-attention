@@ -76,6 +76,10 @@ def get_glue_datasets(
         raw_datasets = raw_datasets.map(
             preprocess_function, batched=True, desc="Running tokenizer on dataset"
         )
+        if task_name == "sst2":
+            raw_datasets = raw_datasets.remove_columns(
+                ["sentence", "token_type_ids", "idx"]
+            )
         raw_datasets.set_format(type="torch")
 
     train_dataset = raw_datasets["train"]

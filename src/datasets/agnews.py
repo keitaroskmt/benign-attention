@@ -47,6 +47,7 @@ def get_agnews_datasets(
         raw_datasets = raw_datasets.map(
             preprocess_function, batched=True, desc="Running tokenizer on dataset"
         )
+        raw_datasets = raw_datasets.remove_columns(["text", "token_type_ids"])
         raw_datasets.set_format(type="torch")
 
     train_dataset = raw_datasets["train"]
