@@ -166,11 +166,14 @@ def main(cfg: DictConfig) -> None:
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "cifar10":
         train_dataset, test_dataset = get_cifar10_hf_datasets(
-            processor=processor, noise_ratio=cfg["noise_ratio"]
+            processor=processor,
+            sample_size=cfg["sample_size"],
+            noise_ratio=cfg["noise_ratio"],
         )
     elif dataset_name == "mnist_snr":
         train_dataset, test_dataset = get_mnist_snr_hf_datasets(
             processor=processor,
+            sample_size=cfg["sample_size"],
             noise_ratio=cfg["noise_ratio"],
             snr=cfg["dataset"]["signal_noise_ratio"],
         )

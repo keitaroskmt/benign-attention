@@ -137,7 +137,7 @@ class OurAttention(nn.Module):
 @hydra.main(config_path="config", config_name="main_bert", version_base=None)
 def main(cfg: DictConfig) -> None:
     wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    wandb.init(project="benign_attention_real_setting", config=wandb_config)
+    wandb.init(project="benign_attention_bert", config=wandb_config)
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
@@ -159,11 +159,13 @@ def main(cfg: DictConfig) -> None:
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "sst2":
         train_dataset, test_dataset, _ = get_glue_datasets(
-            noise_ratio=cfg["noise_ratio"], task_name="sst2"
+            sample_size=cfg["sample_size"],
+            noise_ratio=cfg["noise_ratio"],
+            task_name="sst2",
         )
     elif dataset_name == "agnews":
         train_dataset, test_dataset = get_agnews_datasets(
-            noise_ratio=cfg["noise_ratio"]
+            sample_size=cfg["sample_size"], noise_ratio=cfg["noise_ratio"]
         )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")

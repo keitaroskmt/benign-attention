@@ -2,6 +2,7 @@
 import logging
 import random
 
+import numpy as np
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 
@@ -24,6 +25,7 @@ task_to_keys = {
 
 
 def get_glue_datasets(
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
     task_name: str = "sst2",
     model_name_or_path: str | None = "bert-base-uncased",
@@ -87,6 +89,12 @@ def get_glue_datasets(
         "validation_matched" if task_name == "mnli" else "validation"
     ]
     test_dataset = raw_datasets["test_matched" if task_name == "mnli" else "test"]
+
+    if sample_size is not None:
+        random_indices = np.random.choice(
+            len(train_dataset), sample_size, replace=False
+        )
+        train_dataset = train_dataset.select(random_indices)
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):

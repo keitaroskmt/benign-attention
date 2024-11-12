@@ -1,14 +1,12 @@
 import os
 import logging
 import json
-import math
 
 import torch
 from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
-from torch.nn.init import zeros_, orthogonal_, uniform_, kaiming_uniform_, ones_
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -16,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import BertForSequenceClassification, BertModel
+from transformers import BertForSequenceClassification
 from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.glue import get_glue_datasets
@@ -94,11 +92,14 @@ def main(cfg: DictConfig) -> None:
     dataset_name = cfg["dataset"]["name"]
     if dataset_name == "sst2":
         train_dataset, test_dataset, _ = get_glue_datasets(
-            noise_ratio=cfg["noise_ratio"], task_name="sst2"
+            sample_size=cfg["sample_size"],
+            noise_ratio=cfg["noise_ratio"],
+            task_name="sst2",
         )
     elif dataset_name == "agnews":
         train_dataset, test_dataset = get_agnews_datasets(
-            noise_ratio=cfg["noise_ratio"]
+            sample_size=cfg["sample_size"],
+            noise_ratio=cfg["noise_ratio"],
         )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
@@ -113,23 +114,8 @@ def main(cfg: DictConfig) -> None:
     for name, param in model.named_parameters():
         if name.startswith("encoder.layer.11"):
             pass
-            # if "LayerNorm.weight" in name:
-            #     ones_(param)
-            # elif "LayerNorm.bias" in name:
-            #     zeros_(param)
-            # elif "weight" in name:
-            #     kaiming_uniform_(param, a=math.sqrt(5))
-            # elif "bias" in name:
-            #     if name == "encoder.layer.11.output.dense.bias":
-            #         uniform_(param, -1 / math.sqrt(3072), 1 / math.sqrt(3072))
-            #     else:
-            #         uniform_(param, -1 / math.sqrt(768), 1 / math.sqrt(768))
         elif name.startswith("pooler") or name.startswith("classifier"):
             pass
-            # if "weight" in name:
-            #     kaiming_uniform_(param, a=math.sqrt(5))
-            # elif "bias" in name:
-            #     uniform_(param, -1 / math.sqrt(768), 1 / math.sqrt(768))
         else:
             param.requires_grad = False
 

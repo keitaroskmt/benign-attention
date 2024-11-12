@@ -18,12 +18,16 @@ logger = logging.getLogger(__name__)
 # Following the experimental setup in the paper:
 # https://openreview.net/attachment?id=pF8btdPVTL_&name=supplementary_material#page=36.36
 def get_mnist_snr_datasets(
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
     snr: float = 1.0,
     root: str = "~/pytorch_datasets",
     use_transform: bool = True,
 ) -> tuple[Dataset, Dataset]:
     size = 28
+
+    if sample_size is not None:
+        raise NotImplementedError("Sample size is not supported for MNIST-SNR dataset.")
 
     if use_transform:
         transform = transforms.Compose(
@@ -56,6 +60,7 @@ def get_mnist_snr_datasets(
 
 def get_mnist_snr_hf_datasets(
     processor: ViTImageProcessor,
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
     snr: float = 1.0,
 ) -> tuple[HFDataset, HFDataset]:
@@ -80,9 +85,15 @@ def get_mnist_snr_hf_datasets(
     train_dataset = raw_datasets["train"]
     test_dataset = raw_datasets["test"]
 
+    if sample_size is not None:
+        random_indices = np.random.choice(
+            len(train_dataset), sample_size, replace=False
+        )
+        train_dataset = train_dataset.select(random_indices)
+
     logger.info(f"Key names in the dataset: {train_dataset.column_names}.")
     logger.info(
-        f"Types of input and target are : {type(train_dataset[0]["pixel_values"]), type(train_dataset[0]["label"])}."
+        f"Types of input and target are : {type(train_dataset[0]['pixel_values']), type(train_dataset[0]['label'])}."
     )
     logger.info(f"Size of input tensor is : {train_dataset[0]['pixel_values'].shape}.")
 

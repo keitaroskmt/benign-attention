@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_agnews_datasets(
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
     model_name_or_path: str | None = "bert-base-uncased",
     pad_to_max_length: bool = True,
@@ -52,6 +53,12 @@ def get_agnews_datasets(
 
     train_dataset = raw_datasets["train"]
     test_dataset = raw_datasets["test"]
+
+    if sample_size is not None:
+        random_indices = np.random.choice(
+            len(train_dataset), sample_size, replace=False
+        )
+        train_dataset = train_dataset.select(random_indices)
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):

@@ -15,3 +15,4 @@ warmup_epochs: 10
 num_epochs: 1000
 save_model: false
 feature_extractor: embedding
+num_samples: 5000

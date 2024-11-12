@@ -1,5 +1,6 @@
 import logging
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -14,12 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 def get_cifar10_datasets(
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
     size: int = 32,
     root: str = "~/pytorch_datasets",
     use_transform: bool = True,
 ) -> tuple[Dataset, Dataset]:
     mean, std = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+
+    if sample_size is not None:
+        raise NotImplementedError("Sample size is not supported for MNIST-SNR dataset.")
 
     if use_transform:
         # Note that we don't use RandomHorizontalFlip and RandomCrop to fix training dataset.
@@ -47,6 +52,7 @@ def get_cifar10_datasets(
 
 def get_cifar10_hf_datasets(
     processor: ViTImageProcessor,
+    sample_size: int | None = None,
     noise_ratio: float = 0.0,
 ) -> tuple[HFDataset, HFDataset]:
     raw_datasets = load_dataset("cifar10")
@@ -62,9 +68,15 @@ def get_cifar10_hf_datasets(
     train_dataset = raw_datasets["train"]
     test_dataset = raw_datasets["test"]
 
+    if sample_size is not None:
+        random_indices = np.random.choice(
+            len(train_dataset), sample_size, replace=False
+        )
+        train_dataset = train_dataset.select(random_indices)
+
     logger.info(f"Key names in the dataset: {train_dataset.column_names}.")
     logger.info(
-        f"Types of input and target are : {type(train_dataset[0]["pixel_values"]), type(train_dataset[0]["label"])}."
+        f"Types of input and target are : {type(train_dataset[0]['pixel_values']), type(train_dataset[0]['label'])}."
     )
     logger.info(f"Size of input tensor is : {train_dataset[0]['pixel_values'].shape}.")
 
