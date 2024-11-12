@@ -103,7 +103,9 @@ def main(cfg: DictConfig) -> None:
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    model = BertForSequenceClassification.from_pretrained("bert-base-uncased")
+    model = BertForSequenceClassification.from_pretrained(
+        "bert-base-uncased", num_labels=cfg["dataset"]["num_classes"]
+    )
     model = model.to(device)
     model.num_labels = cfg["dataset"]["num_classes"]
 
@@ -188,6 +190,9 @@ def main(cfg: DictConfig) -> None:
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
+    logger.info(
+        f"Hydra output dir: {hydra.core.hydra_config.HydraConfig.get().runtime.output_dir}"
+    )
 
     losses = []
     train_accs = []
