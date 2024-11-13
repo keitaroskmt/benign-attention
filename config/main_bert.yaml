@@ -14,4 +14,4 @@ noise_ratio: 0.0
 num_epochs: 1000
 save_model: false
 feature_extractor: embedding
-num_samples: 5000
+sample_size: 5000
