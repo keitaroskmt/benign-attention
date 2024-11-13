@@ -11,7 +11,8 @@ seed: 1
 use_ddp: true
 dim: 512
 noise_ratio: 0.0
-num_epochs: 200
+pretrain_num_epochs: 100
+num_epochs: 400
 save_model: false
-feature_extractor: embedding
+pretrain_sample_size: 10000
 sample_size: 5000
