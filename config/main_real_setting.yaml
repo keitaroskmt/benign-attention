@@ -4,7 +4,7 @@ hydra:
 
 defaults:
   - dataset: cifar10
-  - optimizer: adamw
+  - optimizer: sgd
   - _self_
 
 seed: 1
