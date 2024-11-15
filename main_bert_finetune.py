@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 
+from datasets.utils import disable_progress_bar
 from transformers import BertForSequenceClassification, Trainer, TrainingArguments
 from src.datasets.glue import get_glue_datasets_for_finetune
 from src.datasets.agnews import get_agnews_datasets_for_finetune
@@ -21,7 +22,7 @@ def main(cfg: DictConfig) -> None:
         wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         wandb.init(project="benign_attention_bert_finetune", config=wandb_config)
 
-    seed = 0
+    seed = cfg["seed"]
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -73,6 +74,7 @@ def main(cfg: DictConfig) -> None:
         return {"accuracy": (logits.argmax(-1) == labels).mean()}
 
     logger.info(f"Config: {cfg}")
+    disable_progress_bar()
 
     ##### First training phase: pretrain the model without label noise #####
     logger.info("#############################################################")
@@ -80,17 +82,26 @@ def main(cfg: DictConfig) -> None:
 
     # Freeze all layers except the last classifier.
     for name, param in model.named_parameters():
-        if name.startswith("classifier"):
+        if name.startswith("bert.pooler") or name.startswith("classifier"):
             param.requires_grad = True
         else:
             param.requires_grad = False
 
     training_args = TrainingArguments(
-        output_dir="./results",
+        output_dir=os.path.join(
+            "results/bert",
+            dataset_name,
+            f"noise_ratio_{cfg['noise_ratio']}",
+            "pretrain",
+            str(seed),
+        ),
         num_train_epochs=cfg["pretrain_num_epochs"],
         per_device_train_batch_size=16,
         per_device_eval_batch_size=64,
-        logging_dir="./logs",
+        seed=seed,
+        save_safetensors=False,
+        disable_tqdm=True,
+        logging_strategy="epoch",
     )
     trainer = Trainer(
         model=model,
@@ -110,18 +121,26 @@ def main(cfg: DictConfig) -> None:
 
     # Freeze all layers except the last attention layer.
     for name, param in model.named_parameters():
-        # TODO: whether containining `name.startswith("bert.pooler")` or not.
-        if name.startswith("bert.encoder.layer.11.attention.attention"):
+        if name.startswith("bert.encoder.layer.11.attention"):
             param.requires_grad = True
         else:
             param.requires_grad = False
 
     training_args = TrainingArguments(
-        output_dir="./results",
+        output_dir=os.path.join(
+            "results/bert",
+            dataset_name,
+            f"noise_ratio_{cfg['noise_ratio']}",
+            "finetune",
+            str(seed),
+        ),
         num_train_epochs=cfg["num_epochs"],
         per_device_train_batch_size=16,
         per_device_eval_batch_size=64,
-        logging_dir="./logs",
+        seed=seed,
+        save_safetensors=False,
+        disable_tqdm=True,
+        logging_strategy="epoch",
     )
     trainer = Trainer(
         model=model,
