@@ -138,7 +138,7 @@ def calc_accuracy_and_loss(
 
 @hydra.main(config_path="config", config_name="main", version_base=None)
 def main(cfg: DictConfig) -> None:
-    wandb.init(project="benign_attention")
+    wandb.init(project="benign_attention_synthetic")
     wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
 
     # Same scale for the linear head as in the paper
@@ -187,14 +187,6 @@ def main(cfg: DictConfig) -> None:
     optimizer = SGD(params, lr=cfg["learning_rate"])
 
     # Record attention scores and statistics
-    dict_attention_scores = {
-        "sample_id": [],
-        "token_id": [],
-        "label_flipped": [],
-        "time_step": [],
-        "attention_score": [],
-        "cumulative_attention": [],
-    }
     dict_stats_time_step = {
         "time_step": [],
         "loss": [],
@@ -216,28 +208,7 @@ def main(cfg: DictConfig) -> None:
             optimizer.step()
             assert i == 0, "Batch size must be equal to dataset size"
 
-        # Log attention scores
-        for sample_id in range(cfg["train_n"]):
-            for token_id in range(cfg["T"]):
-                dict_attention_scores["sample_id"].append(sample_id)
-                dict_attention_scores["token_id"].append(token_id)
-                dict_attention_scores["label_flipped"].append(
-                    train_dataset.noisy_data_mask[sample_id].item()
-                )
-                dict_attention_scores["time_step"].append(time_step)
-                attention_score = attention_scores[sample_id, token_id].item()
-                dict_attention_scores["attention_score"].append(attention_score)
-                if dict_attention_scores["cumulative_attention"]:
-                    dict_attention_scores["cumulative_attention"].append(
-                        dict_attention_scores["cumulative_attention"][-1]
-                        + attention_score * (1.0 - attention_score)
-                    )
-                else:
-                    dict_attention_scores["cumulative_attention"].append(
-                        attention_score * (1.0 - attention_score)
-                    )
-
-        if time_step % cfg["log_interval"] != 0:
+        if (time_step+1) % cfg["log_interval"] != 0:
             continue
         # Log statistics
         train_accuracy, train_loss = calc_accuracy_and_loss(model, train_loader, device)
@@ -267,15 +238,7 @@ def main(cfg: DictConfig) -> None:
             }
         )
 
-    df_attention_scores = pd.DataFrame.from_dict(dict_attention_scores)
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
-    df_attention_scores.to_csv(
-        os.path.join(
-            hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
-            "attention_scores.csv",
-        ),
-        index=False,
-    )
     df_stats_time_step.to_csv(
         os.path.join(
             hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
@@ -289,15 +252,10 @@ def main(cfg: DictConfig) -> None:
     )
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    df_attention_scores.to_csv(
-        os.path.join(log_dir, "attention_scores.csv"),
-        index=False,
-    )
     df_stats_time_step.to_csv(
         os.path.join(log_dir, "stats_time_step.csv"),
         index=False,
     )
-
     wandb.finish()
 
 

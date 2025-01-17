@@ -20,6 +20,7 @@ from src.datasets.mnist import (
 )
 from src.datasets.cifar import get_cifar10_hf_datasets_for_finetune
 from src.datasets.stl10 import get_stl10_hf_datasets_for_finetune
+from src.datasets.medmnist import get_medmnist_hf_datasets_for_finetune
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,7 @@ def main(cfg: DictConfig) -> None:
                 pretrain_sample_size=cfg["pretrain_sample_size"],
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
+                seed=seed,
             )
         )
     elif dataset_name == "mnist_snr":
@@ -72,6 +74,7 @@ def main(cfg: DictConfig) -> None:
                 pretrain_sample_size=cfg["pretrain_sample_size"],
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
+                seed=seed,
             )
         )
     elif dataset_name == "stl10":
@@ -81,6 +84,18 @@ def main(cfg: DictConfig) -> None:
                 pretrain_sample_size=cfg["pretrain_sample_size"],
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
+                seed=seed,
+            )
+        )
+    elif dataset_name in ["pneumoniamnist", "breastmnist"]:
+        pretrain_dataset, finetune_dataset, test_dataset = (
+            get_medmnist_hf_datasets_for_finetune(
+                processor=processor,
+                pretrain_sample_size=cfg["pretrain_sample_size"],
+                sample_size=cfg["sample_size"],
+                noise_ratio=cfg["noise_ratio"],
+                task_name=dataset_name,
+                seed=seed,
             )
         )
     else:
@@ -88,7 +103,7 @@ def main(cfg: DictConfig) -> None:
 
     model = ViTForImageClassification.from_pretrained(
         "google/vit-base-patch16-224-in21k",
-        num_labels=10,
+        num_labels=cfg["dataset"]["num_classes"],
         attention_probs_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
     )
@@ -109,63 +124,86 @@ def main(cfg: DictConfig) -> None:
     ##### First training phase: pretrain the model without label noise #####
     logger.info("#############################################################")
     logger.info("First training phase: pretraining the model without label noise.")
-
-    # Freeze all layers except the last classifier.
-    for name, param in model.named_parameters():
-        if name.startswith("classifier"):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    training_args = TrainingArguments(
-        output_dir=os.path.join(
-            "results/vit",
-            dataset_name,
-            f"noise_ratio_{cfg['noise_ratio']}",
-            "pretrain",
-            str(seed),
-        ),
-        num_train_epochs=cfg["pretrain_num_epochs"],
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=64,
-        seed=seed,
-        save_safetensors=False,
-        disable_tqdm=True,
-        logging_strategy="epoch",
+    model_save_dir = os.path.join(
+        "results/vit", dataset_name, str(seed), "pretrained_model"
     )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=pretrain_dataset,
-        eval_dataset=test_dataset,
-        compute_metrics=compute_metrics,
-    )
-    trainer.train()
-    result = trainer.evaluate()
-    logger.info(result)
-    trainer.save_state()
+
+    if not os.path.exists(model_save_dir):
+        # Freeze all layers except the last classifier.
+        for name, param in model.named_parameters():
+            if name.startswith("classifier"):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        training_args = TrainingArguments(
+            output_dir=os.path.join(
+                "results/vit",
+                dataset_name,
+                "pretrain",
+                str(seed),
+            ),
+            num_train_epochs=cfg["pretrain_num_epochs"],
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=64,
+            seed=seed,
+            save_strategy="no",
+            save_safetensors=False,
+            disable_tqdm=True,
+            logging_strategy="epoch",
+        )
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=pretrain_dataset,
+            eval_dataset=test_dataset,
+            compute_metrics=compute_metrics,
+        )
+        trainer.train()
+        result = trainer.evaluate()
+        logger.info(result)
+        trainer.save_state()
+        trainer.save_model(model_save_dir)
+    else:
+        logger.info(
+            f"Pretrained model already exists in {model_save_dir}. Skip the pretraining phase."
+        )
+        model = ViTForImageClassification.from_pretrained(
+            model_save_dir,
+            num_labels=cfg["dataset"]["num_classes"],
+            attention_probs_dropout_prob=0.0,
+            hidden_dropout_prob=0.0,
+        )
+        model = model.to(device)
 
     ##### Second training phase: finetune the model with label noise #####
     logger.info("#############################################################")
     logger.info("Second training phase: finetuning the model with label noise.")
     for name, param in model.named_parameters():
-        if name.startswith("vit.encoder.layer.11.attention"):
+        if name.startswith("vit.encoder.layer.11.attention.attention.query") or name.startswith("vit.encoder.layer.11.attention.attention.key"):
             param.requires_grad = True
         else:
             param.requires_grad = False
+    
+    if cfg["revert_weights"]:
+        for name, module in model.named_modules():
+            if name.startswith("vit.encoder.layer.11.attention.attention.query") or name.startswith("vit.encoder.layer.11.attention.attention.key"):
+                assert hasattr(module, "reset_parameters")
+                module.reset_parameters()
 
     training_args = TrainingArguments(
         output_dir=os.path.join(
             "results/vit",
             dataset_name,
             f"noise_ratio_{cfg['noise_ratio']}",
-            "finetune",
+            "finetune_tmp",
             str(seed),
         ),
         num_train_epochs=cfg["num_epochs"],
         per_device_train_batch_size=16,
         per_device_eval_batch_size=64,
         seed=seed,
+        save_strategy="no",
         save_safetensors=False,
         disable_tqdm=True,
         logging_strategy="epoch",
@@ -180,6 +218,11 @@ def main(cfg: DictConfig) -> None:
     trainer.train()
     result = trainer.evaluate()
     logger.info(result)
+
+    train_result = trainer.evaluate(eval_dataset=finetune_dataset)
+    logger.info("train dataset result")
+    logger.info(train_result)
+
     trainer.save_state()
 
     if cfg["use_ddp"]:

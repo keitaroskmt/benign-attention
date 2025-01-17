@@ -14,10 +14,13 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import BertForSequenceClassification, get_scheduler
+from transformers import (
+    ViTImageProcessor,
+    ViTForImageClassification,
+)
 
-from src.datasets.glue import get_glue_datasets
-from src.datasets.agnews import get_agnews_datasets
+from src.datasets.cifar import get_cifar10_hf_datasets
+from src.datasets.mnist import get_mnist_snr_hf_datasets
 from src.distributed_utils import setup, cleanup
 
 
@@ -39,7 +42,7 @@ def get_loss_and_logits(
         input["attention_mask"].to(device) if "attention_mask" in input else None
     )
     output = model(
-        input["input_ids"].to(device),
+        input["pixel_values"].to(device),
         attention_mask=attention_mask,
         labels=input["label"].to(device),
     )
@@ -66,10 +69,11 @@ def evaluate(
     return correct, total
 
 
-@hydra.main(config_path="config", config_name="main_bert", version_base=None)
+@hydra.main(config_path="config", config_name="main_vit", version_base=None)
 def main(cfg: DictConfig) -> None:
-    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    wandb.init(project="benign_attention_bert_all_layer", config=wandb_config)
+    if (cfg["use_ddp"] and dist.get_rank() == 0) or not cfg["use_ddp"]:
+        wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+        wandb.init(project="benign_attention_vit_last_layer")
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
@@ -88,34 +92,38 @@ def main(cfg: DictConfig) -> None:
         device = local_rank
         setup(rank, world_size)
 
+    processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+
     dataset_name = cfg["dataset"]["name"]
-    if dataset_name == "sst2":
-        train_dataset, test_dataset, _ = get_glue_datasets(
+    if dataset_name == "cifar10":
+        train_dataset, test_dataset = get_cifar10_hf_datasets(
+            processor=processor,
             sample_size=cfg["sample_size"],
             noise_ratio=cfg["noise_ratio"],
-            task_name="sst2",
         )
-    elif dataset_name == "agnews":
-        train_dataset, test_dataset = get_agnews_datasets(
+    elif dataset_name == "mnist_snr":
+        train_dataset, test_dataset = get_mnist_snr_hf_datasets(
+            processor=processor,
             sample_size=cfg["sample_size"],
             noise_ratio=cfg["noise_ratio"],
+            snr=cfg["dataset"]["signal_noise_ratio"],
         )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
-    model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased",
+    model = ViTForImageClassification.from_pretrained(
+        "google/vit-base-patch16-224-in21k",
         num_labels=cfg["dataset"]["num_classes"],
-        attention_probs_dropout_prob=0.0,
+        attention_rpobs_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
     )
-    model = model.to(device)
+    model.to(device)
 
     # Freeze all layers except the last layer and initialize the last layer.
     for name, param in model.named_parameters():
-        if name.startswith("encoder.layer.11"):
+        if name.startswith("vit.encoder.layer.11"):
             pass
-        elif name.startswith("pooler") or name.startswith("classifier"):
+        elif name.startswith("vit.layernorm") or name.startswith("classifier"):
             pass
         else:
             param.requires_grad = False
@@ -123,6 +131,7 @@ def main(cfg: DictConfig) -> None:
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
         model = DDP(model, device_ids=[local_rank])
+
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -164,13 +173,6 @@ def main(cfg: DictConfig) -> None:
             f"Optimizer {cfg['optimizer']['name']} is not supported."
         )
 
-    scheduler = get_scheduler(
-        "linear",
-        optimizer,
-        num_warmup_steps=0,
-        num_training_steps=len(train_loader) * cfg["num_epochs"],
-    )
-
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
@@ -192,7 +194,6 @@ def main(cfg: DictConfig) -> None:
             loss, _ = get_loss_and_logits(model, input, device)
             loss.backward()
             optimizer.step()
-        scheduler.step()
 
         sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
         sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)
@@ -227,7 +228,7 @@ def main(cfg: DictConfig) -> None:
         )
         with open(file_name, "w") as f:
             json.dump(
-                {"loss": losses, "train_accs": train_accs, "test_accs": test_accs}, f
+                {"losses": losses, "train_accs": train_accs, "test_accs": test_accs}, f
             )
 
         if cfg["save_model"]:

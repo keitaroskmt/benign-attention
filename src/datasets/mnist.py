@@ -171,6 +171,7 @@ def get_mnist_hf_datasets_for_finetune(
     pretrain_sample_size: int,
     sample_size: int,
     noise_ratio: float = 0.0,
+    seed: int = 42,
 ) -> tuple[HFDataset, HFDataset, HFDataset]:
     raw_datasets = load_dataset("mnist")
     raw_datasets = raw_datasets.rename_column("image", "pixel_values")
@@ -194,6 +195,7 @@ def get_mnist_hf_datasets_for_finetune(
         train_dataset
     ), "Sample size is too large."
 
+    np.random.seed(seed)
     random_indices = np.random.choice(
         len(train_dataset), pretrain_sample_size + sample_size, replace=False
     )
@@ -207,7 +209,6 @@ def get_mnist_hf_datasets_for_finetune(
     logger.info(f"Size of input tensor is : {train_dataset[0]['pixel_values'].shape}.")
 
     # Add label noise only to the finetune_dataset
-    noise_ratio = 0.0
     if noise_ratio > 0.0:
         finetune_dataset = finetune_dataset.map(
             lambda example: {

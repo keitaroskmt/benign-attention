@@ -122,6 +122,7 @@ def get_glue_datasets_for_finetune(
     task_name: str = "sst2",
     model_name_or_path: str | None = "bert-base-uncased",
     pad_to_max_length: bool = True,
+    seed: int = 42,
 ) -> tuple[Dataset, Dataset, Dataset]:
     if task_name not in task_to_keys:
         raise ValueError(f"Task {task_name} not found in GLUE tasks.")
@@ -186,6 +187,7 @@ def get_glue_datasets_for_finetune(
         train_dataset
     ), "Sample size is too large."
 
+    np.random.seed(seed)
     random_indices = np.random.choice(
         len(train_dataset), pretrain_sample_size + sample_size, replace=False
     )

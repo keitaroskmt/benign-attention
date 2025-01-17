@@ -1,0 +1,5 @@
+# @package _global_
+dataset:
+  name: trec
+  batch_size: 128
+  num_classes: 6

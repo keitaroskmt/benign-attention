@@ -1,4 +1,6 @@
 import os
+import logging
+import json
 
 import numpy as np
 import torch
@@ -7,34 +9,31 @@ import pandas as pd
 import wandb
 import hydra
 from omegaconf import OmegaConf, DictConfig
-from torch.nn.init import zeros_, eye_, kaiming_uniform_
+from torch.nn.init import zeros_, eye_, orthogonal_
 from torch.nn.parameter import Parameter
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 class CustomDataset(Dataset):
     def __init__(
         self,
         num_samples: int,
-        seq_len: int,
         embed_dim: int,
         vmu_1: Tensor,
         vmu_2: Tensor,
+        seq_len: int = 32,
         rho: float = 0.0,
         noise_ratio: float = 0.0,
         seed: int = 0,
     ) -> None:
         self._num_samples = num_samples
-        self._seq_len = seq_len
-        self._embed_dim = embed_dim
 
-        assert vmu_1.size() == (
-            embed_dim,
-        ), f"Signal vector vmu_1 size {vmu_1.size()} must be equal to {(embed_dim,)}"
-        assert vmu_2.size() == (
-            embed_dim,
-        ), f"Signal vector vmu_2 size {vmu_2.size()} must be equal to {(embed_dim,)}"
+        assert vmu_1.size() == (embed_dim,), f"Signal vector vmu_1 size {vmu_1.size()} must be equal to {(embed_dim,)}"
+        assert vmu_2.size() == (embed_dim,), f"Signal vector vmu_2 size {vmu_2.size()} must be equal to {(embed_dim,)}"
         assert rho > 0.0, "rho must be the positive constant"
 
         # Fix data generation
@@ -43,18 +42,17 @@ class CustomDataset(Dataset):
         self.data = torch.tensor(data, dtype=torch.float32)
         self.label = torch.cat([torch.ones(num_samples // 2), -torch.ones(num_samples - num_samples // 2)])
 
-        # First token is relevant token
-        self.data[:, 0, :] = self.data[:, 0, :] + torch.where(
-            self.label.view(-1, 1) == 1, vmu_1, vmu_2
-        )
-        # Second token is weakly relevant token that aligns with the relevant token
-        self.data[:, 1, :] = self.data[:, 1, :] + rho * torch.where(
-            self.label.view(-1, 1) == 1, vmu_1, vmu_2
-        )
-        # Third token is weakly relevant token that aligns with the opposite direction of relevant token
-        self.data[:, 2, :] = self.data[:, 2, :] + rho * torch.where(
-            self.label.view(-1, 1) == 1, vmu_2, vmu_1
-        )
+        # First and second token is relevant token
+        self.data[:, 0, :] = self.data[:, 0, :] + torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+        self.data[:, 1, :] = self.data[:, 1, :] + torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+
+        # Third and fourth token is weakly relevant token that aligns with the relevant token
+        self.data[:, 2, :] = self.data[:, 2, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+        self.data[:, 3, :] = self.data[:, 3, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_1, vmu_2)
+        # Fifth and sixth token is weakly relevant token that aligns with the opposite direction of relevant token
+        self.data[:, 4, :] = self.data[:, 4, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_2, vmu_1)
+        self.data[:, 5, :] = self.data[:, 5, :] + rho * torch.where(self.label.view(-1, 1) == 1, vmu_2, vmu_1)
+
         # Create noisy data
         noisy_data_size = int(np.ceil(num_samples * noise_ratio))
         assert noisy_data_size > 0 if noise_ratio > 0.0 else noisy_data_size == 0
@@ -81,21 +79,16 @@ class Attention(nn.Module):
         super().__init__()
 
         self.embed_dim = embed_dim
-        self.W = Parameter(torch.empty(embed_dim, embed_dim, **factory_kwargs))
         self.p = Parameter(torch.empty(embed_dim, 1, **factory_kwargs))
         self.nu = Parameter(torch.empty(embed_dim, 1, **factory_kwargs))
 
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        # eye_(self.W)
-        kaiming_uniform_(self.W, a=5 ** 0.5)
         zeros_(self.p)
 
     def init_linear_head(self, vmu_1: Tensor, vmu_2: Tensor, nu_norm: float) -> None:
-        self.nu.data.copy_(
-            (vmu_1 - vmu_2).view(-1, 1) / torch.norm(vmu_1 - vmu_2) * nu_norm
-        )
+        self.nu.data.copy_((vmu_1 - vmu_2).view(-1, 1) / torch.norm(vmu_1 - vmu_2) * nu_norm)
 
     def forward_with_scores(self, x: Tensor) -> tuple[Tensor, Tensor]:
         assert x.dim() == 3, f"Input must have 3 dimensions, got {x.dim()}"
@@ -104,23 +97,19 @@ class Attention(nn.Module):
             embed_dim == self.embed_dim
         ), f"Input embedding dimension {embed_dim} must match layer embedding dimension {self.embed_dim}"
 
-        attention_logits = (x @ self.W @ self.p).squeeze(-1)
+        attention_logits = (x @ self.p).squeeze(-1)
         attention_scores = torch.softmax(attention_logits, dim=-1)
 
         token_scores = (x @ self.nu).squeeze(-1)
         output = torch.sum(attention_scores * token_scores, dim=1)
-        assert output.size() == (
-            batch_size,
-        ), f"Output size {output.size()} must be equal to {(batch_size,)}"
+        assert output.size() == (batch_size,), f"Output size {output.size()} must be equal to {(batch_size,)}"
         return output, attention_scores
 
     def forward(self, x: Tensor) -> Tensor:
         return self.forward_with_scores(x)[0]
 
 
-def calc_accuracy_and_loss(
-    model: nn.Module, loader: DataLoader, device: torch.device | str
-) -> tuple[float, float]:
+def calc_accuracy_and_loss(model: nn.Module, loader: DataLoader, device: torch.device | str) -> tuple[float, float]:
     model.eval()
     correct = 0
     loss_total = 0
@@ -160,20 +149,20 @@ def main(cfg: DictConfig) -> None:
 
     train_dataset = CustomDataset(
         cfg["train_n"],
-        cfg["T"],
         cfg["embed_dim"],
         vmu_1,
         vmu_2,
+        seq_len=cfg["T"],
         rho=cfg["rho"],
         noise_ratio=cfg["noise_ratio"],
         seed=cfg["seed"],
     )
     test_dataset = CustomDataset(
         cfg["test_n"],
-        cfg["T"],
         cfg["embed_dim"],
         vmu_1,
         vmu_2,
+        seq_len=cfg["T"],
         rho=cfg["rho"],
         noise_ratio=0.0,
         seed=cfg["seed"],
@@ -183,28 +172,21 @@ def main(cfg: DictConfig) -> None:
 
     model = Attention(embed_dim=cfg["embed_dim"], device=device)
     model.init_linear_head(vmu_1, vmu_2, nu_norm)
-    params = [model.W, model.p]
+    params = [model.p]
     optimizer = SGD(params, lr=cfg["learning_rate"])
 
     # Record attention scores and statistics
-    dict_attention_scores = {
-        "sample_id": [],
-        "token_id": [],
-        "label_flipped": [],
-        "time_step": [],
-        "attention_score": [],
-        "cumulative_attention": [],
-    }
     dict_stats_time_step = {
         "time_step": [],
-        "loss": [],
-        "train_accuracy": [],
-        "test_accuracy": [],
-        "train_loss": [],
-        "test_loss": [],
-        "alignment_vmu_1": [],
-        "alignment_vmu_2": [],
+        "mathfrak_s_1_clean": [],
+        "mathfrak_s_2_clean": [],
+        "mathfrak_s_1_noisy": [],
+        "mathfrak_s_2_noisy": [],
     }
+    mathfrak_s_1_clean = 0.0
+    mathfrak_s_1_noisy = 0.0
+    mathfrak_s_2_clean = 0.0
+    mathfrak_s_2_noisy = 0.0
 
     for time_step in range(cfg["num_steps"]):
         for i, (data, target) in enumerate(train_loader):
@@ -218,64 +200,40 @@ def main(cfg: DictConfig) -> None:
 
         # Log attention scores
         for sample_id in range(cfg["train_n"]):
-            for token_id in range(cfg["T"]):
-                dict_attention_scores["sample_id"].append(sample_id)
-                dict_attention_scores["token_id"].append(token_id)
-                dict_attention_scores["label_flipped"].append(
-                    train_dataset.noisy_data_mask[sample_id].item()
-                )
-                dict_attention_scores["time_step"].append(time_step)
-                attention_score = attention_scores[sample_id, token_id].item()
-                dict_attention_scores["attention_score"].append(attention_score)
-                if dict_attention_scores["cumulative_attention"]:
-                    dict_attention_scores["cumulative_attention"].append(
-                        dict_attention_scores["cumulative_attention"][-1]
-                        + attention_score * (1.0 - attention_score)
-                    )
-                else:
-                    dict_attention_scores["cumulative_attention"].append(
-                        attention_score * (1.0 - attention_score)
-                    )
+            attention_score_relevant = attention_scores[sample_id, 0].item() + attention_scores[sample_id, 1].item()
+            mathfrak = attention_score_relevant * (1.0 - attention_score_relevant)
 
-        if time_step % cfg["log_interval"] != 0:
-            continue
-        # Log statistics
-        train_accuracy, train_loss = calc_accuracy_and_loss(model, train_loader, device)
-        test_accuracy, test_loss = calc_accuracy_and_loss(model, test_loader, device)
+            # Clean data
+            if not train_dataset.noisy_data_mask[sample_id]:
+                if train_dataset[sample_id][1] == 1:
+                    mathfrak_s_1_clean += mathfrak
+                if train_dataset[sample_id][1] == -1:
+                    mathfrak_s_2_clean += mathfrak
+            # Noisy data
+            else:
+                if train_dataset[sample_id][1] == 1:
+                    mathfrak_s_1_noisy += mathfrak
+                if train_dataset[sample_id][1] == -1:
+                    mathfrak_s_2_noisy += mathfrak
 
-        p_norm = torch.norm(model.p).item()
-        alignment_vmu_1 = model.p.squeeze()[0].item() / p_norm
-        alignment_vmu_2 = model.p.squeeze()[1].item() / p_norm
+        # relevant tokens
+        wandb.log({"clean_prop": attention_scores[-1, 0].item() + attention_scores[-1, 1].item()})
+        # weakly relevant tokens
+        wandb.log({"noisy_prop": attention_scores[0, 4].item() + attention_scores[0, 5].item()})
+
         dict_stats_time_step["time_step"].append(time_step)
-        dict_stats_time_step["loss"].append(loss.item())
-        dict_stats_time_step["train_accuracy"].append(train_accuracy)
-        dict_stats_time_step["test_accuracy"].append(test_accuracy)
-        dict_stats_time_step["train_loss"].append(train_loss)
-        dict_stats_time_step["test_loss"].append(test_loss)
-        dict_stats_time_step["alignment_vmu_1"].append(alignment_vmu_1)
-        dict_stats_time_step["alignment_vmu_2"].append(alignment_vmu_2)
+        dict_stats_time_step["mathfrak_s_1_clean"].append(mathfrak_s_1_clean)
+        dict_stats_time_step["mathfrak_s_2_clean"].append(mathfrak_s_2_clean)
+        dict_stats_time_step["mathfrak_s_1_noisy"].append(mathfrak_s_1_noisy)
+        dict_stats_time_step["mathfrak_s_2_noisy"].append(mathfrak_s_2_noisy)
 
-        wandb.log(
-            {
-                "loss": loss.item(),
-                "train_accuracy": train_accuracy,
-                "test_accuracy": test_accuracy,
-                "train_loss": train_loss,
-                "test_loss": test_loss,
-                "alignment_vmu_1": alignment_vmu_1,
-                "alignment_vmu_2": alignment_vmu_2,
-            }
-        )
+    # Log statistics
+    train_accuracy, train_loss = calc_accuracy_and_loss(model, train_loader, device)
+    test_accuracy, test_loss = calc_accuracy_and_loss(model, test_loader, device)
+    logger.info(f"Train accuracy: {train_accuracy}, Train loss: {train_loss}")
+    logger.info(f"Test accuracy: {test_accuracy}, Test loss: {test_loss}")
 
-    df_attention_scores = pd.DataFrame.from_dict(dict_attention_scores)
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
-    df_attention_scores.to_csv(
-        os.path.join(
-            hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
-            "attention_scores.csv",
-        ),
-        index=False,
-    )
     df_stats_time_step.to_csv(
         os.path.join(
             hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
@@ -284,19 +242,36 @@ def main(cfg: DictConfig) -> None:
         index=False,
     )
 
-    log_dir = os.path.join(
-        "results/synthetic", f"d_{cfg['embed_dim']}", f"signal_{cfg['signal_norm']}", f"rho_{cfg['rho']}"
+    # Output directory
+    output_path = os.path.join(
+        "results",
+        "mathfrak",
+        f"dim_{cfg['embed_dim']}",
+        f"signal_{cfg['signal_norm']}",
+        f"noise_{cfg['noise_ratio']}",
+        f"seed_{cfg['seed']}",
     )
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    df_attention_scores.to_csv(
-        os.path.join(log_dir, "attention_scores.csv"),
-        index=False,
-    )
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
     df_stats_time_step.to_csv(
-        os.path.join(log_dir, "stats_time_step.csv"),
+        os.path.join(
+            output_path,
+            "stats_time_step.csv",
+        ),
         index=False,
     )
+    with open(os.path.join(output_path, "out.json"), "w") as f:
+        json.dump(
+            {
+                "train_accuracy": train_accuracy,
+                "train_loss": train_loss,
+                "test_accuracy": test_accuracy,
+                "test_loss": test_loss,
+            },
+            f,
+        )
+    with open(os.path.join(output_path, "config.yaml"), "w") as f:
+        OmegaConf.save(cfg, f)
 
     wandb.finish()
 

@@ -175,6 +175,7 @@ def main(cfg: DictConfig) -> None:
     # Use only for extracting the features.
     for param in pretrained_model.parameters():
         param.requires_grad = False
+    pretrained_model.eval()
 
     # preprocess the dataset
     if cfg["feature_extractor"] == "embedding":
@@ -250,12 +251,8 @@ def main(cfg: DictConfig) -> None:
     )
 
     if cfg["optimizer"]["name"] == "sgd":
-        optimizer = SGD(
-            model.parameters(),
-            lr=cfg["optimizer"]["learning_rate"],
-            momentum=cfg["optimizer"]["momentum"],
-            weight_decay=cfg["optimizer"]["weight_decay"],
-        )
+        # We don't use the regularization technique, such as weight decay.
+        optimizer = SGD(model.parameters(), lr=cfg["optimizer"]["learning_rate"])
     elif cfg["optimizer"]["name"] == "adamw":
         optimizer = AdamW(
             model.parameters(),
@@ -267,22 +264,19 @@ def main(cfg: DictConfig) -> None:
             f"Optimizer {cfg['optimizer']['name']} is not supported."
         )
 
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=len(train_loader) * cfg["warmup_epochs"],
-        num_training_steps=len(train_loader) * cfg["num_epochs"],
-    )
-
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
+    logger.info(
+        f"Hydra output dir: {hydra.core.hydra_config.HydraConfig.get().runtime.output_dir}"
+    )
 
     losses = []
     train_accs = []
     test_accs = []
 
-    model.train()
     for epoch in range(cfg["num_epochs"]):
+        model.train()
         if cfg["use_ddp"]:
             assert train_sampler is not None
             train_sampler.set_epoch(epoch)
@@ -296,7 +290,6 @@ def main(cfg: DictConfig) -> None:
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
-        scheduler.step()
 
         sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
         sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)

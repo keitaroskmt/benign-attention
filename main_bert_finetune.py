@@ -11,6 +11,7 @@ from datasets.utils import disable_progress_bar
 from transformers import BertForSequenceClassification, Trainer, TrainingArguments
 from src.datasets.glue import get_glue_datasets_for_finetune
 from src.datasets.agnews import get_agnews_datasets_for_finetune
+from src.datasets.trec import get_trec_datasets_for_finetune
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +44,7 @@ def main(cfg: DictConfig) -> None:
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
                 task_name="sst2",
+                seed=seed,
             )
         )
     elif dataset_name == "agnews":
@@ -51,6 +53,16 @@ def main(cfg: DictConfig) -> None:
                 pretrain_sample_size=cfg["pretrain_sample_size"],
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
+                seed=seed,
+            )
+        )
+    elif dataset_name == "trec":
+        pretrain_dataset, finetune_dataset, test_dataset = (
+            get_trec_datasets_for_finetune(
+                pretrain_sample_size=cfg["pretrain_sample_size"],
+                sample_size=cfg["sample_size"],
+                noise_ratio=cfg["noise_ratio"],
+                seed=seed,
             )
         )
     else:
@@ -79,41 +91,58 @@ def main(cfg: DictConfig) -> None:
     ##### First training phase: pretrain the model without label noise #####
     logger.info("#############################################################")
     logger.info("First training phase: pretraining the model without label noise.")
-
-    # Freeze all layers except the last classifier.
-    for name, param in model.named_parameters():
-        if name.startswith("bert.pooler") or name.startswith("classifier"):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    training_args = TrainingArguments(
-        output_dir=os.path.join(
-            "results/bert",
-            dataset_name,
-            f"noise_ratio_{cfg['noise_ratio']}",
-            "pretrain",
-            str(seed),
-        ),
-        num_train_epochs=cfg["pretrain_num_epochs"],
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=64,
-        seed=seed,
-        save_safetensors=False,
-        disable_tqdm=True,
-        logging_strategy="epoch",
+    model_save_dir = os.path.join(
+        "results/bert", dataset_name, str(seed), "pretrained_model"
     )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=pretrain_dataset,
-        eval_dataset=test_dataset,
-        compute_metrics=compute_metrics,
-    )
-    trainer.train()
-    result = trainer.evaluate()
-    logger.info(result)
-    trainer.save_state()
+
+    if not os.path.exists(model_save_dir):
+        # Freeze all layers except the last classifier.
+        for name, param in model.named_parameters():
+            if name.startswith("bert.pooler") or name.startswith("classifier"):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        training_args = TrainingArguments(
+            output_dir=os.path.join(
+                "results/bert",
+                dataset_name,
+                f"noise_ratio_{cfg['noise_ratio']}",
+                "pretrain",
+                str(seed),
+            ),
+            num_train_epochs=cfg["pretrain_num_epochs"],
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=64,
+            seed=seed,
+            save_strategy="no",
+            save_safetensors=False,
+            disable_tqdm=True,
+            logging_strategy="epoch",
+        )
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=pretrain_dataset,
+            eval_dataset=test_dataset,
+            compute_metrics=compute_metrics,
+        )
+        trainer.train()
+        result = trainer.evaluate()
+        logger.info(result)
+        trainer.save_state()
+        trainer.save_model(model_save_dir)
+    else:
+        logger.info(
+            f"Pretrained model already exists in {model_save_dir}. Skip the pretraining phase."
+        )
+        model = BertForSequenceClassification.from_pretrained(
+            model_save_dir,
+            num_labels=cfg["dataset"]["num_classes"],
+            attention_probs_dropout_prob=0.0,
+            hidden_dropout_prob=0.0,
+        )
+        model = model.to(device)
 
     ##### Second training phase: finetune the model with label noise #####
     logger.info("#############################################################")
@@ -121,7 +150,9 @@ def main(cfg: DictConfig) -> None:
 
     # Freeze all layers except the last attention layer.
     for name, param in model.named_parameters():
-        if name.startswith("bert.encoder.layer.11.attention"):
+        if name.startswith(
+            "bert.encoder.layer.11.attention.self.key"
+        ) or name.startswith("bert.encoder.layer.11.attention.self.query"):
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -138,6 +169,7 @@ def main(cfg: DictConfig) -> None:
         per_device_train_batch_size=16,
         per_device_eval_batch_size=64,
         seed=seed,
+        save_strategy="no",
         save_safetensors=False,
         disable_tqdm=True,
         logging_strategy="epoch",

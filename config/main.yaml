@@ -8,10 +8,12 @@ defaults:
 delta: 0.01
 train_n: 20
 T: 8
-rho: 0.2
-embed_dim: 4000
-learning_rate: 1e-4
+rho: 0.1
+embed_dim: 2000
+learning_rate: 5e-3
 signal_norm: 20.0
 num_steps: 1000
 noise_ratio: 0.2
 test_n: 1000
+seed: 0
+log_interval: 10
