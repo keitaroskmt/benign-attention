@@ -1,13 +1,13 @@
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
 
 defaults:
   - _self_
 
 delta: 0.01
 train_n: 20
-T: 8
+seq_len: 8
 rho: 0.1
 embed_dim: 2000
 learning_rate: 5e-3
@@ -17,3 +17,7 @@ noise_ratio: 0.2
 test_n: 1000
 seed: 0
 log_interval: 10
+
+wandb:
+  project: benign_attention_synthetic
+  entity: keitaroskmt
