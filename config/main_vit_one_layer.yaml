@@ -1,0 +1,25 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+
+defaults:
+  - _self_
+
+delta: 0.01
+train_n: 20
+seq_len: 8
+rho: 0.1
+embed_dim: 2000
+mlp_dim: 2000
+learning_rate: 5e-3
+signal_norm: 20.0
+num_steps: 1000
+noise_ratio: 0.2
+test_n: 1000
+seed: 0
+log_interval: 10
+use_skip_connection: true
+
+wandb:
+  project: benign_attention_synthetic_vit_one_layer
+  entity: keitaroskmt
