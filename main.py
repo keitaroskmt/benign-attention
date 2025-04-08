@@ -207,12 +207,11 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     dict_stats_time_step = {
         "time_step": [],
         "loss": [],
+        "attention_score": [],
         "train_accuracy": [],
         "test_accuracy": [],
         "train_loss": [],
         "test_loss": [],
-        "attention_score": [],
-        "cumulative_attention": [],
     }
 
     for time_step in range(cfg["num_steps"]):
@@ -227,6 +226,10 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
                 msg = "Batch size must be equal to dataset size"
                 raise ValueError(msg)
 
+        dict_stats_time_step["time_step"].append(time_step)
+        dict_stats_time_step["loss"].append(loss.item())
+        dict_stats_time_step["attention_score"].append(attention_scores.tolist())
+
         if time_step % cfg["log_interval"] == 0:
             # Log statistics
             train_accuracy, train_loss = calc_accuracy_and_loss(
@@ -240,22 +243,10 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
                 device,
             )
 
-            dict_stats_time_step["time_step"].append(time_step)
-            dict_stats_time_step["loss"].append(loss.item())
             dict_stats_time_step["train_accuracy"].append(train_accuracy)
             dict_stats_time_step["test_accuracy"].append(test_accuracy)
             dict_stats_time_step["train_loss"].append(train_loss)
             dict_stats_time_step["test_loss"].append(test_loss)
-            dict_stats_time_step["attention_score"].append(attention_scores.tolist())
-            if dict_stats_time_step["cumulative_attention"]:
-                dict_stats_time_step["cumulative_attention"].append(
-                    dict_stats_time_step["cumulative_attention"][-1]
-                    + (attention_scores * (1.0 - attention_scores)).tolist(),
-                )
-            else:
-                dict_stats_time_step["cumulative_attention"].append(
-                    (attention_scores * (1.0 - attention_scores)).tolist(),
-                )
             wandb.log(
                 {
                     "loss": loss.item(),
@@ -272,10 +263,15 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
                 train_accuracy,
                 test_accuracy,
             )
+        else:
+            dict_stats_time_step["train_accuracy"].append(np.nan)
+            dict_stats_time_step["test_accuracy"].append(np.nan)
+            dict_stats_time_step["train_loss"].append(np.nan)
+            dict_stats_time_step["test_loss"].append(np.nan)
 
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
     output_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
-    df_stats_time_step.to_csv(output_dir / "stats_time_step.csv", index=False)
+    df_stats_time_step.to_json(output_dir / "stats_time_step.json")
     logger.info("output_dir: %s", output_dir)
     run.config["output_dir"] = str(output_dir)
     wandb.finish()
