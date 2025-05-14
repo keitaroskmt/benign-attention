@@ -3,7 +3,7 @@
 This repository contains the official implementation of our ICML 2025 paper: [Benign Overfitting in Token Selection of Attention Mechanism](https://arxiv.org/abs/2409.17625)
 
 <p align="center">
-      <img src="https://github.com/keitaroskmt/benign-attention/blob/94f5c60a20acb0a46b6cd0812842ee155eb63af8/img/figure1.png", width=50%, height=50%>
+      <img src="https://github.com/keitaroskmt/benign-attention/blob/94f5c60a20acb0a46b6cd0812842ee155eb63af8/img/figure1.png", width=90%, height=90%>
 <!p>
 
 ## Requirements
