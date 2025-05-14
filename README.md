@@ -3,7 +3,7 @@
 This repository contains the official implementation of our ICML 2025 paper: [Benign Overfitting in Token Selection of Attention Mechanism](https://arxiv.org/abs/2409.17625)
 
 <p align="center">
-      <img src="https://github.com/keitaroskmt/benign-attention/blob/94f5c60a20acb0a46b6cd0812842ee155eb63af8/img/figure1.png", width=90%, height=90%>
+      <img src="https://github.com/keitaroskmt/benign-attention/blob/94f5c60a20acb0a46b6cd0812842ee155eb63af8/img/figure1.png">
 <!p>
 
 ## Requirements
@@ -14,7 +14,6 @@ We recommend using [`uv`](https://github.com/astral-sh/uv?tab=readme-ov-file#ins
 To set up the environment, run:
 
 ```bash
-uv init
 uv sync
 ```
 
@@ -71,7 +70,6 @@ uv run main_bert_finetune.py dataset=agnews wandb.entity=your_account
 
 To run with different hyperparameter, you can either specify them in the command line or modify `config/main_bert.yaml`.
 The dataset argument supports `agnews`, `sst2`, and `trec`.
-
 
 ### Citation
 
