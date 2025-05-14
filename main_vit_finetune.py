@@ -1,36 +1,40 @@
-import os
 import logging
+from pathlib import Path
 
-import wandb
 import hydra
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
-
-from datasets.utils import disable_progress_bar
 from transformers import (
-    ViTImageProcessor,
-    ViTForImageClassification,
     Trainer,
     TrainingArguments,
+    ViTForImageClassification,
+    ViTImageProcessor,
 )
-from src.datasets.mnist import (
-    get_mnist_snr_hf_datasets_for_finetune,
-    get_mnist_hf_datasets_for_finetune,
-)
-from src.datasets.cifar import get_cifar10_hf_datasets_for_finetune
-from src.datasets.stl10 import get_stl10_hf_datasets_for_finetune
-from src.datasets.medmnist import get_medmnist_hf_datasets_for_finetune
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+import wandb
+from datasets.utils import disable_progress_bar
+from src.datasets.cifar import get_cifar10_hf_datasets_for_finetune
+from src.datasets.medmnist import get_medmnist_hf_datasets_for_finetune
+from src.datasets.mnist import (
+    get_mnist_hf_datasets_for_finetune,
+    get_mnist_snr_hf_datasets_for_finetune,
+)
+from src.datasets.stl10 import get_stl10_hf_datasets_for_finetune
+from src.hf_utils import AttentionScoreCallback
 
 
 @hydra.main(config_path="config", config_name="main_vit", version_base=None)
 def main(cfg: DictConfig) -> None:
-    if not cfg["use_ddp"] or (cfg["use_ddp"] and os.environ.get("RANK", "0") == 0):
-        wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-        wandb.init(project="benign_attention_vit_finetune", config=wandb_config)
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    run = wandb.init(
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        job_type=cfg.wandb.job_type,
+        config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+        save_code=True,
+    )
+    logger.info("wandb run url: %s", run.get_url())
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
@@ -41,9 +45,6 @@ def main(cfg: DictConfig) -> None:
         device = "mps"
     else:
         device = "cpu"
-
-    if cfg["use_ddp"]:
-        dist.init_process_group("nccl")
 
     processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
     dataset_name = cfg["dataset"]["name"]
@@ -99,7 +100,8 @@ def main(cfg: DictConfig) -> None:
             )
         )
     else:
-        raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
+        error_message = f"Dataset {dataset_name} is not supported."
+        raise NotImplementedError(error_message)
 
     model = ViTForImageClassification.from_pretrained(
         "google/vit-base-patch16-224-in21k",
@@ -118,17 +120,15 @@ def main(cfg: DictConfig) -> None:
         labels = eval_pred.label_ids
         return {"accuracy": (logits.argmax(-1) == labels).mean()}
 
-    logger.info(f"Config: {cfg}")
+    logger.info("Config: %(config)s", extra={"config": cfg})
     disable_progress_bar()
 
     ##### First training phase: pretrain the model without label noise #####
     logger.info("#############################################################")
     logger.info("First training phase: pretraining the model without label noise.")
-    model_save_dir = os.path.join(
-        "results/vit", dataset_name, str(seed), "pretrained_model"
-    )
+    model_save_dir = Path("results/vit") / dataset_name / "pretrain" / f"seed_{seed}"
 
-    if not os.path.exists(model_save_dir):
+    if not model_save_dir.exists():
         # Freeze all layers except the last classifier.
         for name, param in model.named_parameters():
             if name.startswith("classifier"):
@@ -137,12 +137,7 @@ def main(cfg: DictConfig) -> None:
                 param.requires_grad = False
 
         training_args = TrainingArguments(
-            output_dir=os.path.join(
-                "results/vit",
-                dataset_name,
-                "pretrain",
-                str(seed),
-            ),
+            output_dir=Path("results/vit") / dataset_name / "pretrain" / f"seed_{seed}",
             num_train_epochs=cfg["pretrain_num_epochs"],
             per_device_train_batch_size=16,
             per_device_eval_batch_size=64,
@@ -166,7 +161,8 @@ def main(cfg: DictConfig) -> None:
         trainer.save_model(model_save_dir)
     else:
         logger.info(
-            f"Pretrained model already exists in {model_save_dir}. Skip the pretraining phase."
+            "Pretrained model already exists in %(model_save_dir)s. Skip the pretraining phase.",
+            extra={"model_save_dir": model_save_dir},
         )
         model = ViTForImageClassification.from_pretrained(
             model_save_dir,
@@ -180,25 +176,35 @@ def main(cfg: DictConfig) -> None:
     logger.info("#############################################################")
     logger.info("Second training phase: finetuning the model with label noise.")
     for name, param in model.named_parameters():
-        if name.startswith("vit.encoder.layer.11.attention.attention.query") or name.startswith("vit.encoder.layer.11.attention.attention.key"):
+        if name.startswith(
+            (
+                "vit.encoder.layer.11.attention.attention.query",
+                "vit.encoder.layer.11.attention.attention.key",
+            ),
+        ):
             param.requires_grad = True
         else:
             param.requires_grad = False
-    
+
     if cfg["revert_weights"]:
         for name, module in model.named_modules():
-            if name.startswith("vit.encoder.layer.11.attention.attention.query") or name.startswith("vit.encoder.layer.11.attention.attention.key"):
+            if name.startswith(
+                (
+                    "vit.encoder.layer.11.attention.attention.query",
+                    "vit.encoder.layer.11.attention.attention.key",
+                ),
+            ):
                 assert hasattr(module, "reset_parameters")
                 module.reset_parameters()
 
     training_args = TrainingArguments(
-        output_dir=os.path.join(
-            "results/vit",
-            dataset_name,
-            f"noise_ratio_{cfg['noise_ratio']}",
-            "finetune_tmp",
-            str(seed),
-        ),
+        output_dir=Path("results/vit")
+        / dataset_name
+        / "finetune"
+        / f"noise_ratio_{cfg['noise_ratio']}"
+        / f"sample_size_{cfg['sample_size']}"
+        / f"revert_weights_{cfg['revert_weights']}"
+        / f"seed_{seed}",
         num_train_epochs=cfg["num_epochs"],
         per_device_train_batch_size=16,
         per_device_eval_batch_size=64,
@@ -214,22 +220,21 @@ def main(cfg: DictConfig) -> None:
         train_dataset=finetune_dataset,
         eval_dataset=test_dataset,
         compute_metrics=compute_metrics,
+        callbacks=[AttentionScoreCallback()],
     )
     trainer.train()
     result = trainer.evaluate()
     logger.info(result)
+    wandb.log({f"eval_test/{k}": v for k, v in result.items()})
 
     train_result = trainer.evaluate(eval_dataset=finetune_dataset)
     logger.info("train dataset result")
     logger.info(train_result)
+    wandb.log({f"eval_train/{k}": v for k, v in train_result.items()})
 
     trainer.save_state()
-
-    if cfg["use_ddp"]:
-        dist.destroy_process_group()
-
-    if not cfg["use_ddp"] or (cfg["use_ddp"] and os.environ.get("RANK", "0") == 0):
-        wandb.finish()
+    run.config["model_save_dir"] = str(model_save_dir)
+    wandb.finish()
 
 
 if __name__ == "__main__":

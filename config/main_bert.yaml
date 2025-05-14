@@ -16,3 +16,10 @@ num_epochs: 400
 save_model: false
 pretrain_sample_size: 10000
 sample_size: 5000
+revert_weights: false
+attention_scores: false
+
+wandb:
+  project: benign_attention
+  entity: keitaroskmt
+  job_type: bert_finetune

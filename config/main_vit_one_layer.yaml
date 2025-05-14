@@ -19,7 +19,9 @@ test_n: 1000
 seed: 0
 log_interval: 10
 use_skip_connection: true
+log_attention_score: true
 
 wandb:
   project: benign_attention_synthetic_vit_one_layer
   entity: keitaroskmt
+  job_type: attention_dynamics

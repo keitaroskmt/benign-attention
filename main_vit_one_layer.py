@@ -101,6 +101,7 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     run = wandb.init(
         project=cfg.wandb.project,
         entity=cfg.wandb.entity,
+        job_type=cfg.wandb.job_type,
         config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         save_code=True,
     )
@@ -174,7 +175,7 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
         dict_stats_time_step["loss"].append(loss.item())
         dict_stats_time_step["attention_score"].append(attention_scores.tolist())
 
-        if time_step % cfg["log_interval"] == 0:
+        if time_step % cfg["log_interval"] == cfg["log_interval"] - 1:
             # Log statistics
             train_accuracy, train_loss = calc_accuracy_and_loss(
                 model,
@@ -213,6 +214,10 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
             dict_stats_time_step["train_loss"].append(np.nan)
             dict_stats_time_step["test_loss"].append(np.nan)
 
+    if not cfg["log_attention_score"]:
+        dict_stats_time_step["attention_score"] = [np.nan] * len(
+            dict_stats_time_step["time_step"],
+        )
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
     output_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     df_stats_time_step.to_json(output_dir / "stats_time_step.json")

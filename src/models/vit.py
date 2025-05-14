@@ -1,8 +1,7 @@
 import torch
-from torch import nn, Tensor
-
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from torch import Tensor, nn
 
 
 # https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/vit.py
@@ -30,7 +29,11 @@ class FeedForward(nn.Module):
 
 class Attention(nn.Module):
     def __init__(
-        self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -86,11 +89,14 @@ class Transformer(nn.Module):
                 nn.ModuleList(
                     [
                         Attention(
-                            dim=dim, heads=heads, dim_head=dim_head, dropout=dropout
+                            dim=dim,
+                            heads=heads,
+                            dim_head=dim_head,
+                            dropout=dropout,
                         ),
                         FeedForward(dim=dim, hidden_dim=mlp_dim, dropout=dropout),
-                    ]
-                )
+                    ],
+                ),
             )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -121,9 +127,9 @@ class ViT(nn.Module):
         image_height, image_width = pair(image_size)
         patch_height, patch_width = pair(patch_size)
 
-        assert (
-            image_height % patch_height == 0 and image_width % patch_width == 0
-        ), "Image dimensions must be divisible by the patch size."
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, (
+            "Image dimensions must be divisible by the patch size."
+        )
 
         num_patches = (image_height // patch_height) * (image_width // patch_width)
         patch_dim = channels * patch_height * patch_width
