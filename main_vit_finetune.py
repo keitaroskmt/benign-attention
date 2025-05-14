@@ -4,6 +4,7 @@ from pathlib import Path
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
+from torch import tensor
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -15,16 +16,13 @@ import wandb
 from datasets.utils import disable_progress_bar
 from src.datasets.cifar import get_cifar10_hf_datasets_for_finetune
 from src.datasets.medmnist import get_medmnist_hf_datasets_for_finetune
-from src.datasets.mnist import (
-    get_mnist_hf_datasets_for_finetune,
-    get_mnist_snr_hf_datasets_for_finetune,
-)
+from src.datasets.mnist import get_mnist_hf_datasets_for_finetune
 from src.datasets.stl10 import get_stl10_hf_datasets_for_finetune
 from src.hf_utils import AttentionScoreCallback
 
 
 @hydra.main(config_path="config", config_name="main_vit", version_base=None)
-def main(cfg: DictConfig) -> None:
+def main(cfg: DictConfig) -> None:  # noqa: C901, PLR0912, PLR0915
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     run = wandb.init(
@@ -56,16 +54,6 @@ def main(cfg: DictConfig) -> None:
                 sample_size=cfg["sample_size"],
                 noise_ratio=cfg["noise_ratio"],
                 seed=seed,
-            )
-        )
-    elif dataset_name == "mnist_snr":
-        pretrain_dataset, finetune_dataset, test_dataset = (
-            get_mnist_snr_hf_datasets_for_finetune(
-                processor=processor,
-                pretrain_sample_size=cfg["pretrain_sample_size"],
-                sample_size=cfg["sample_size"],
-                snr=1.0,
-                noise_ratio=cfg["noise_ratio"],
             )
         )
     elif dataset_name == "mnist":
@@ -111,7 +99,7 @@ def main(cfg: DictConfig) -> None:
     )
     model = model.to(device)
 
-    def compute_metrics(eval_pred):
+    def compute_metrics(eval_pred) -> dict[str, tensor]:  # noqa: ANN001
         logits = (
             eval_pred.predictions[0]
             if isinstance(eval_pred.predictions, tuple)
@@ -194,7 +182,9 @@ def main(cfg: DictConfig) -> None:
                     "vit.encoder.layer.11.attention.attention.key",
                 ),
             ):
-                assert hasattr(module, "reset_parameters")
+                if not hasattr(module, "reset_parameters"):
+                    msg = f"Module {name} does not have a 'reset_parameters' method."
+                    raise AttributeError(msg)
                 module.reset_parameters()
 
     training_args = TrainingArguments(

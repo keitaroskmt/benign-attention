@@ -15,9 +15,10 @@ signal_norm: 20.0
 num_steps: 1000
 noise_ratio: 0.2
 test_n: 1000
-seed: 0
+seed: 42
 log_interval: 10
 
 wandb:
-  project: benign_attention_synthetic
+  project: benign_attention
   entity: keitaroskmt
+  job_type: synthetic

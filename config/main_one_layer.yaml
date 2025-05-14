@@ -16,12 +16,11 @@ signal_norm: 20.0
 num_steps: 1000
 noise_ratio: 0.2
 test_n: 1000
-seed: 0
+seed: 42
 log_interval: 10
 use_skip_connection: true
-log_attention_score: true
 
 wandb:
-  project: benign_attention_synthetic_vit_one_layer
+  project: benign_attention
   entity: keitaroskmt
-  job_type: attention_dynamics
+  job_type: synthetic_one_layer

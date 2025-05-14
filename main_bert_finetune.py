@@ -3,8 +3,8 @@ from pathlib import Path
 
 import hydra
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
+from torch import tensor
 from transformers import BertForSequenceClassification, Trainer, TrainingArguments
 
 import wandb
@@ -16,7 +16,7 @@ from src.hf_utils import AttentionScoreCallback
 
 
 @hydra.main(config_path="config", config_name="main_bert", version_base=None)
-def main(cfg: DictConfig) -> None:
+def main(cfg: DictConfig) -> None:  # noqa: C901, PLR0912, PLR0915
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     run = wandb.init(
@@ -79,7 +79,7 @@ def main(cfg: DictConfig) -> None:
     )
     model = model.to(device)
 
-    def compute_metrics(eval_pred):
+    def compute_metrics(eval_pred) -> dict[str, tensor]:  # noqa: ANN001
         logits = (
             eval_pred.predictions[0]
             if isinstance(eval_pred.predictions, tuple)
@@ -167,7 +167,9 @@ def main(cfg: DictConfig) -> None:
                     "bert.encoder.layer.11.attention.self.query",
                 ),
             ):
-                assert hasattr(module, "reset_parameters")
+                if not hasattr(module, "reset_parameters"):
+                    msg = f"Module {name} does not have a 'reset_parameters' method."
+                    raise AttributeError(msg)
                 module.reset_parameters()
 
     training_args = TrainingArguments(

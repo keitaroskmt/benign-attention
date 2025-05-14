@@ -13,7 +13,6 @@ from torch.utils.data import DataLoader
 
 import wandb
 from main import CustomDataset
-from src.models.vit import FeedForward
 
 
 class SingleHeadAttention(nn.Module):
@@ -35,7 +34,23 @@ class SingleHeadAttention(nn.Module):
         return out, attn
 
 
-class OneLayerViT(nn.Module):
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class OneLayerEncoder(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -94,7 +109,7 @@ def calc_accuracy_and_loss(
     return correct / total, loss_total / total
 
 
-@hydra.main(config_path="config", config_name="main_vit_one_layer", version_base=None)
+@hydra.main(config_path="config", config_name="main_one_layer", version_base=None)
 def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
@@ -141,7 +156,7 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     train_loader = DataLoader(train_dataset, batch_size=cfg["train_n"])
     test_loader = DataLoader(test_dataset, batch_size=cfg["test_n"])
 
-    model = OneLayerViT(
+    model = OneLayerEncoder(
         dim=cfg["embed_dim"],
         mlp_dim=cfg["mlp_dim"],
         use_skip_connection=cfg["use_skip_connection"],
@@ -214,10 +229,6 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
             dict_stats_time_step["train_loss"].append(np.nan)
             dict_stats_time_step["test_loss"].append(np.nan)
 
-    if not cfg["log_attention_score"]:
-        dict_stats_time_step["attention_score"] = [np.nan] * len(
-            dict_stats_time_step["time_step"],
-        )
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
     output_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     df_stats_time_step.to_json(output_dir / "stats_time_step.json")
