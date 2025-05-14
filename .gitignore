@@ -164,7 +164,8 @@ cython_debug/
 wandb/
 outputs/
 multirun/
+results/
 *.csv
 *.out
-job*.sh
+job*.sh*
 *.err

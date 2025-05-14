@@ -5,125 +5,70 @@ import hydra
 import numpy as np
 import pandas as pd
 import torch
+from einops import repeat
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
-from torch.nn.init import kaiming_uniform_, zeros_
-from torch.nn.parameter import Parameter
 from torch.optim.sgd import SGD
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 import wandb
+from main import CustomDataset
+from src.models.vit import FeedForward
 
 
-class CustomDataset(Dataset):
-    """Synthetic dataset aligning with the analysis setting in the paper."""
-
-    def __init__(  # noqa: PLR0913
-        self,
-        cfg: DictConfig,
-        num_samples: int,
-        vmu_1: Tensor,
-        vmu_2: Tensor,
-        noise_ratio: float = 0.0,
-        seed: int = 0,
-    ) -> None:
-        self.num_samples = num_samples
-        self.seq_len = cfg["seq_len"]
-        self.embed_dim = cfg["embed_dim"]
-        self.rho = cfg["rho"]
-        if self.rho <= 0.0:
-            msg = "rho must be the positive constant"
-            raise ValueError(msg)
-
-        # Fix data generation
-        rng = np.random.default_rng(seed)
-        data = rng.standard_normal((num_samples, self.seq_len, self.embed_dim))
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.label = torch.cat(
-            [torch.ones(num_samples // 2), -torch.ones(num_samples - num_samples // 2)],
-        )
-
-        # First token is relevant token
-        self.data[:, 0, :] = self.data[:, 0, :] + torch.where(
-            self.label.view(-1, 1) == 1,
-            vmu_1,
-            vmu_2,
-        )
-        # Second token is weakly relevant token that aligns with the relevant token
-        self.data[:, 1, :] = self.data[:, 1, :] + self.rho * torch.where(
-            self.label.view(-1, 1) == 1,
-            vmu_1,
-            vmu_2,
-        )
-        # Third token is weakly relevant token
-        # that aligns with the opposite direction of relevant token
-        self.data[:, 2, :] = self.data[:, 2, :] + self.rho * torch.where(
-            self.label.view(-1, 1) == 1,
-            vmu_2,
-            vmu_1,
-        )
-        # Create noisy data
-        noisy_data_size = int(np.ceil(num_samples * noise_ratio))
-        assert noisy_data_size > 0 if noise_ratio > 0.0 else noisy_data_size == 0  # noqa: S101
-
-        self.noisy_data_mask = torch.zeros(num_samples, dtype=torch.bool)
-        self.noisy_data_mask[: noisy_data_size // 2] = True
-        self.noisy_data_mask[
-            num_samples // 2 : num_samples // 2 + noisy_data_size // 2
-        ] = True
-        self.label = torch.where(self.noisy_data_mask, -self.label, self.label)
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
-        return self.data[idx], self.label[idx]
-
-
-class Attention(nn.Module):
-    """Toy attention model aligning with the analysis setting in the paper."""
-
-    def __init__(self, embed_dim: int, device: torch.device | None = None) -> None:
-        factory_kwargs = {"device": device}
+class SingleHeadAttention(nn.Module):
+    def __init__(self, dim: int) -> None:
         super().__init__()
 
-        self.embed_dim = embed_dim
-        self.W = Parameter(torch.empty(embed_dim, embed_dim, **factory_kwargs))
-        self.p = Parameter(torch.empty(embed_dim, 1, **factory_kwargs))
-        self.nu = Parameter(torch.empty(embed_dim, 1, **factory_kwargs))
+        self.scale = dim ** (-0.5)
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
 
-        self._reset_parameters()
+    def forward_with_scores(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        x = self.norm(x)
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
 
-    def _reset_parameters(self) -> None:
-        kaiming_uniform_(self.W, a=5**0.5)
-        zeros_(self.p)
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(dots)
+        out = torch.matmul(attn, v)
+        return out, attn
 
-    def init_linear_head(self, vmu_1: Tensor, vmu_2: Tensor, nu_norm: float) -> None:
-        self.nu.data.copy_(
-            (vmu_1 - vmu_2).view(-1, 1) / torch.norm(vmu_1 - vmu_2) * nu_norm,
-        )
+
+class OneLayerViT(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        mlp_dim: int,
+        use_skip_connection: bool = True,  # noqa: FBT001, FBT002
+    ) -> None:
+        super().__init__()
+        self.embed_dim = dim
+        self.use_skip_connection = use_skip_connection
+        self.attn = SingleHeadAttention(dim)
+        self.ff = FeedForward(dim=dim, hidden_dim=mlp_dim)
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, 1)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))  # Corresponds to p
 
     def forward_with_scores(self, x: Tensor) -> tuple[Tensor, Tensor]:
         if x.dim() != 3:  # noqa: PLR2004
             msg = f"Input must have 3 dimensions, got {x.dim()}"
             raise ValueError(msg)
         batch_size, _, embed_dim = x.size()
-        if embed_dim != self.embed_dim:
-            msg = (
-                f"Input embedding dimension {embed_dim} must match "
-                f"layer embedding dimension {self.embed_dim}"
-            )
-            raise ValueError(msg)
-
-        attention_logits = (x @ self.W @ self.p).squeeze(-1)
-        attention_scores = torch.softmax(attention_logits, dim=-1)
-
-        token_scores = (x @ self.nu).squeeze(-1)
-        output = torch.sum(attention_scores * token_scores, dim=1)
-        assert output.size() == (batch_size,), (  # noqa: S101
-            f"Output size {output.size()} must be equal to {(batch_size,)}"
-        )
-        return output, attention_scores
+        cls_tokens = repeat(self.cls_token, "1 1 d -> b 1 d", b=batch_size)
+        x = torch.cat((cls_tokens, x), dim=1)
+        out, attention_scores = self.attn.forward_with_scores(x)
+        # Fetch softmax probabilities for the query at the position of class token
+        attention_scores = attention_scores[:, 0, 1:]
+        if self.use_skip_connection:
+            x = out + x
+            x = self.ff(x) + x
+        else:
+            x = self.ff(out)
+        x = self.norm(x)
+        x = self.head(x[:, 0]).squeeze(1)
+        return x, attention_scores
 
     def forward(self, x: Tensor) -> Tensor:
         return self.forward_with_scores(x)[0]
@@ -149,20 +94,18 @@ def calc_accuracy_and_loss(
     return correct / total, loss_total / total
 
 
-@hydra.main(config_path="config", config_name="main", version_base=None)
+@hydra.main(config_path="config", config_name="main_vit_one_layer", version_base=None)
 def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     run = wandb.init(
         project=cfg.wandb.project,
         entity=cfg.wandb.entity,
+        job_type=cfg.wandb.job_type,
         config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         save_code=True,
     )
     logger.info("wandb run url: %s", run.get_url())
-
-    # Same scale for the linear head as in the paper
-    nu_norm = 1 / cfg["signal_norm"]
 
     # In this experiment, we use orthogonal basis e_1 and e_2
     # as signal vectors vmu_1 and vmu_2, respectively.
@@ -198,10 +141,12 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
     train_loader = DataLoader(train_dataset, batch_size=cfg["train_n"])
     test_loader = DataLoader(test_dataset, batch_size=cfg["test_n"])
 
-    model = Attention(embed_dim=cfg["embed_dim"], device=device)
-    model.init_linear_head(vmu_1, vmu_2, nu_norm)
-    params = [model.W, model.p]
-    optimizer = SGD(params, lr=cfg["learning_rate"])
+    model = OneLayerViT(
+        dim=cfg["embed_dim"],
+        mlp_dim=cfg["mlp_dim"],
+        use_skip_connection=cfg["use_skip_connection"],
+    ).to(device)
+    optimizer = SGD(model.parameters(), lr=cfg["learning_rate"])
 
     # Record attention scores and statistics
     dict_stats_time_step = {
@@ -230,7 +175,7 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
         dict_stats_time_step["loss"].append(loss.item())
         dict_stats_time_step["attention_score"].append(attention_scores.tolist())
 
-        if time_step % cfg["log_interval"] == 0:
+        if time_step % cfg["log_interval"] == cfg["log_interval"] - 1:
             # Log statistics
             train_accuracy, train_loss = calc_accuracy_and_loss(
                 model,
@@ -269,6 +214,10 @@ def main(cfg: DictConfig) -> None:  # noqa: PLR0915
             dict_stats_time_step["train_loss"].append(np.nan)
             dict_stats_time_step["test_loss"].append(np.nan)
 
+    if not cfg["log_attention_score"]:
+        dict_stats_time_step["attention_score"] = [np.nan] * len(
+            dict_stats_time_step["time_step"],
+        )
     df_stats_time_step = pd.DataFrame.from_dict(dict_stats_time_step)
     output_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     df_stats_time_step.to_json(output_dir / "stats_time_step.json")

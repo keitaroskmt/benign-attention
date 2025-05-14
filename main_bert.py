@@ -7,49 +7,46 @@ from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
-from torch.nn.parameter import Parameter
 from torch.nn.init import zeros_, orthogonal_, uniform_
+from torch.nn.parameter import Parameter
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import (
-    ViTImageProcessor,
-    ViTModel,
-)
+from transformers import BertModel
 from transformers import get_cosine_schedule_with_warmup
 
-from src.datasets.cifar import get_cifar10_hf_datasets
-from src.datasets.mnist import get_mnist_snr_hf_datasets
+from src.datasets.glue import get_glue_datasets
+from src.datasets.agnews import get_agnews_datasets
 from src.distributed_utils import setup, cleanup
 
 
-def get_logits(
-    cfg: DictConfig, pretrained_model: nn.Module, model: nn.Module, data: Tensor
-) -> Tensor:
-    with torch.no_grad():
-        if cfg["feature_extractor"] == "embedding":
-            feature = (
-                pretrained_model(data, output_hidden_states=True, return_dict=True)
-                .hidden_states[0]
-                .detach()
-            )
-        elif cfg["feature_extractor"] == "encoder":
-            feature = pretrained_model(
-                data, return_dict=True
-            ).last_hidden_state.detach()
-        else:
-            raise NotImplementedError(
-                f"Feature extractor {cfg['feature_extractor']} is not supported."
-            )
-    return model(feature)
+def get_pred_and_target(
+    model: nn.Module,
+    input,
+    device: torch.device | str | int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Get the prediction tensor from the model.
+    Args:
+        model: Model to be used for prediction.
+        input: Object from DataLoader.
+        device: Device where the model is placed.
+    Returns:
+        tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
+    """
+    data = input["input_ids"].to(device)
+    target = input["label"].to(device)
+    attention_mask = (
+        input["attention_mask"].to(device) if "attention_mask" in input else None
+    )
+    return model(data, attention_mask=attention_mask), target
 
 
 def evaluate(
-    cfg: DictConfig,
-    pretrained_model: nn.Module,
     model: nn.Module,
     loader: DataLoader,
     device: torch.device | str | int,
@@ -61,9 +58,8 @@ def evaluate(
     correct = torch.tensor(0, device=device)
     total = torch.tensor(0, device=device)
     with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            pred = get_logits(cfg, pretrained_model, model, data)
+        for input in loader:
+            pred, target = get_pred_and_target(model, input, device)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -138,11 +134,10 @@ class OurAttention(nn.Module):
         return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
 
-@hydra.main(config_path="config", config_name="main_vit", version_base=None)
+@hydra.main(config_path="config", config_name="main_bert", version_base=None)
 def main(cfg: DictConfig) -> None:
-    if (cfg["use_ddp"] and dist.get_rank() == 0) or not cfg["use_ddp"]:
-        wandb.init(project="benign_attention_vit")
-        wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb.init(project="benign_attention_bert", config=wandb_config)
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
@@ -161,27 +156,73 @@ def main(cfg: DictConfig) -> None:
         device = local_rank
         setup(rank, world_size)
 
-    processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
-
     dataset_name = cfg["dataset"]["name"]
-    if dataset_name == "cifar10":
-        train_dataset, test_dataset = get_cifar10_hf_datasets(
-            processor=processor,
+    if dataset_name == "sst2":
+        train_dataset, test_dataset, _ = get_glue_datasets(
             sample_size=cfg["sample_size"],
             noise_ratio=cfg["noise_ratio"],
+            task_name="sst2",
         )
-    elif dataset_name == "mnist_snr":
-        train_dataset, test_dataset = get_mnist_snr_hf_datasets(
-            processor=processor,
-            sample_size=cfg["sample_size"],
-            noise_ratio=cfg["noise_ratio"],
-            snr=cfg["dataset"]["signal_noise_ratio"],
+    elif dataset_name == "agnews":
+        train_dataset, test_dataset = get_agnews_datasets(
+            sample_size=cfg["sample_size"], noise_ratio=cfg["noise_ratio"]
         )
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
+    pretrained_model = BertModel.from_pretrained("bert-base-uncased")
+    pretrained_model = pretrained_model.to(device)
+    # Use only for extracting the features.
+    for param in pretrained_model.parameters():
+        param.requires_grad = False
+    pretrained_model.eval()
+
+    # preprocess the dataset
+    if cfg["feature_extractor"] == "embedding":
+
+        def preprocess_function(examples):
+            with torch.no_grad():
+                examples["input_ids"] = (
+                    pretrained_model(
+                        examples["input_ids"].to(device),
+                        attention_mask=examples["attention_mask"].to(device),
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    .hidden_states[0]
+                    .detach()
+                    .cpu()
+                )
+            return examples
+
+    elif cfg["feature_extractor"] == "encoder":
+
+        def preprocess_function(examples):
+            with torch.no_grad():
+                examples["input_ids"] = (
+                    pretrained_model(
+                        examples["input_ids"].to(device),
+                        attention_mask=examples["attention_mask"].to(device),
+                        return_dict=True,
+                    )
+                    .last_hidden_state.detach()
+                    .cpu()
+                )
+            return examples
+    else:
+        raise NotImplementedError(
+            f"Feature extractor {cfg['feature_extractor']} is not supported."
+        )
+
+    train_dataset = train_dataset.map(preprocess_function, batched=True)
+    test_dataset = test_dataset.map(preprocess_function, batched=True)
+
+    model = OurAttention(dim=cfg["dim"], num_classes=cfg["dataset"]["num_classes"])
+    model = model.to(device)
+
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
+        model = DDP(model, device_ids=[local_rank])
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -209,25 +250,9 @@ def main(cfg: DictConfig) -> None:
         pin_memory=True,
     )
 
-    pretrained_model = ViTModel.from_pretrained("google/vit-base-patch16-224")
-    pretrained_model.to(device)
-    # Use only for extracting the features.
-    for param in pretrained_model.parameters():
-        param.requires_grad = False
-
-    model = OurAttention(dim=cfg["dim"], num_classes=cfg["dataset"]["num_classes"])
-    model = model.to(device)
-    if cfg["use_ddp"]:
-        pretrained_model = DDP(pretrained_model, device_ids=[local_rank])
-        model = DDP(model, device_ids=[local_rank])
-
     if cfg["optimizer"]["name"] == "sgd":
-        optimizer = SGD(
-            model.parameters(),
-            lr=cfg["optimizer"]["learning_rate"],
-            momentum=cfg["optimizer"]["momentum"],
-            weight_decay=cfg["optimizer"]["weight_decay"],
-        )
+        # We don't use the regularization technique, such as weight decay.
+        optimizer = SGD(model.parameters(), lr=cfg["optimizer"]["learning_rate"])
     elif cfg["optimizer"]["name"] == "adamw":
         optimizer = AdamW(
             model.parameters(),
@@ -238,12 +263,6 @@ def main(cfg: DictConfig) -> None:
         raise NotImplementedError(
             f"Optimizer {cfg['optimizer']['name']} is not supported."
         )
-
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=len(train_loader) * cfg["warmup_epochs"],
-        num_training_steps=len(train_loader) * cfg["num_epochs"],
-    )
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -256,26 +275,24 @@ def main(cfg: DictConfig) -> None:
     train_accs = []
     test_accs = []
 
-    model.train()
     for epoch in range(cfg["num_epochs"]):
+        model.train()
         if cfg["use_ddp"]:
             assert train_sampler is not None
             train_sampler.set_epoch(epoch)
-        for data, target in train_loader:
+        for input in train_loader:
             optimizer.zero_grad()
-            data, target = data.to(device), target.to(device)
-            logits = get_logits(cfg, pretrained_model, model, data)
+            logits, target = get_pred_and_target(
+                model,
+                input,
+                device,
+            )
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
-        scheduler.step()
 
-        sum_train_corrects, sum_train_total = evaluate(
-            cfg, pretrained_model, model, train_loader, device
-        )
-        sum_test_corrects, sum_test_total = evaluate(
-            cfg, pretrained_model, model, test_loader, device
-        )
+        sum_train_corrects, sum_train_total = evaluate(model, train_loader, device)
+        sum_test_corrects, sum_test_total = evaluate(model, test_loader, device)
         if cfg["use_ddp"]:
             dist.barrier()
             dist.all_reduce(sum_train_corrects)
@@ -307,7 +324,7 @@ def main(cfg: DictConfig) -> None:
         )
         with open(file_name, "w") as f:
             json.dump(
-                {"losses": losses, "train_accs": train_accs, "test_accs": test_accs}, f
+                {"loss": losses, "train_accs": train_accs, "test_accs": test_accs}, f
             )
 
         if cfg["save_model"]:

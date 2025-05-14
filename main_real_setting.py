@@ -7,51 +7,59 @@ from torch import nn, Tensor
 from torch.optim.sgd import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
-from torch.nn.parameter import Parameter
 from torch.nn.init import zeros_, orthogonal_, uniform_
+from torch.nn.parameter import Parameter
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import (
-    ViTImageProcessor,
-    ViTModel,
-)
+from einops.layers.torch import Rearrange
 from transformers import get_cosine_schedule_with_warmup
 
-from src.datasets.cifar import get_cifar10_hf_datasets
-from src.datasets.mnist import get_mnist_snr_hf_datasets
+from src.datasets.cifar import get_cifar10_datasets
+from src.datasets.glue import get_glue_datasets
+from src.datasets.agnews import get_agnews_datasets
+from src.datasets.mnist import get_mnist_snr_datasets
 from src.distributed_utils import setup, cleanup
 
 
-def get_logits(
-    cfg: DictConfig, pretrained_model: nn.Module, model: nn.Module, data: Tensor
-) -> Tensor:
-    with torch.no_grad():
-        if cfg["feature_extractor"] == "embedding":
-            feature = (
-                pretrained_model(data, output_hidden_states=True, return_dict=True)
-                .hidden_states[0]
-                .detach()
-            )
-        elif cfg["feature_extractor"] == "encoder":
-            feature = pretrained_model(
-                data, return_dict=True
-            ).last_hidden_state.detach()
-        else:
-            raise NotImplementedError(
-                f"Feature extractor {cfg['feature_extractor']} is not supported."
-            )
-    return model(feature)
+def get_pred_and_target(
+    model: nn.Module,
+    input,
+    dataset_name: str,
+    device: torch.device | str | int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Get the prediction tensor from the model.
+    Args:
+        model: Model to be used for prediction.
+        input: Object from DataLoader.
+        dataset_name: Name of the dataset.
+        device: Device where the model is placed.
+    Returns:
+        tuple[Tensor, Tensor]: The prediction tensor and the target tensor.
+    """
+    if dataset_name == "cifar10" or dataset_name == "mnist_snr":
+        data, target = input[0].to(device), input[1].to(device)
+        return model(data), target
+    elif dataset_name == "sst2" or dataset_name == "agnews":
+        data = input["input_ids"].to(device)
+        target = input["label"].to(device)
+        attention_mask = (
+            input["attention_mask"].to(device) if "attention_mask" in input else None
+        )
+        return model(data, attention_mask=attention_mask), target
+    else:
+        raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
 
 def evaluate(
-    cfg: DictConfig,
-    pretrained_model: nn.Module,
     model: nn.Module,
     loader: DataLoader,
+    dataset_name: str,
     device: torch.device | str | int,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -61,9 +69,8 @@ def evaluate(
     correct = torch.tensor(0, device=device)
     total = torch.tensor(0, device=device)
     with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            pred = get_logits(cfg, pretrained_model, model, data)
+        for input in loader:
+            pred, target = get_pred_and_target(model, input, dataset_name, device)
             correct += pred.argmax(dim=1).eq(target).sum()
             total += len(target)
     return correct, total
@@ -75,23 +82,22 @@ class OurAttention(nn.Module):
     """
 
     def __init__(
-        self, dim: int, num_classes: int, embed_dim: int = 768, device=None, dtype=None
+        self, embed_dim: int, num_classes: int, device=None, dtype=None
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
-        self.dim = dim
-        self.num_classes = num_classes
         self.embed_dim = embed_dim
-        self.W = Parameter(torch.empty(embed_dim, dim, **factory_kwargs))
-        self.p = Parameter(torch.empty(dim, 1, **factory_kwargs))
+        self.num_classes = num_classes
+        self.W = Parameter(torch.empty(embed_dim, embed_dim, **factory_kwargs))
+        self.p = Parameter(torch.empty(embed_dim, 1, **factory_kwargs))
         self.nu = Parameter(torch.empty(embed_dim, num_classes, **factory_kwargs))
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
         orthogonal_(self.W)
         zeros_(self.p)
-        uniform_(self.nu, -1 / self.dim**0.5, 1 / self.dim**0.5)
+        uniform_(self.nu, -1 / self.embed_dim**0.5, 1 / self.embed_dim**0.5)
 
     def forward_with_scores(
         self, x: Tensor, attention_mask: Tensor | None = None
@@ -137,15 +143,148 @@ class OurAttention(nn.Module):
         """
         return self.forward_with_scores(x, attention_mask=attention_mask)[0]
 
+    # TODO: (keitaroskmt) Implement forward with fixed linear head nu
+    def forward_with_fixed_head(self, x: Tensor) -> Tensor:
+        raise NotImplementedError()
 
-@hydra.main(config_path="config", config_name="main_vit", version_base=None)
+
+class ToyVisionTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        size: int,
+        patch_size: int,
+        num_classes: int,
+        dim: int,
+        channels: int = 3,
+    ):
+        super().__init__()
+        height, width = size, size
+        patch_height, patch_width = patch_size, patch_size
+
+        assert (
+            height % patch_height == 0 and width % patch_width == 0
+        ), "Dimensions must be divisible by the patch size."
+
+        num_patches = (height // patch_height) * (width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange(
+                "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+                p1=patch_height,
+                p2=patch_width,
+            ),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.attention = OurAttention(dim, num_classes)
+
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size, channels, height, width).
+        """
+        assert attention_mask is None, "Attention mask is not supported for ViT."
+
+        x = self.to_patch_embedding(x)
+        return self.attention(x)
+
+
+class ToyTextTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_classes: int,
+        vocab_size: int,
+        dim: int,
+    ):
+        super().__init__()
+
+        self.embedding_layer = nn.Embedding(
+            num_embeddings=vocab_size, embedding_dim=dim
+        )
+        self.attention = OurAttention(dim, num_classes)
+
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_len).
+            attention_mask: Attention mask tensor of shape (batch_size, seq_len).
+                1 for unmasked, 0 for masked.
+        """
+        # (batch_size, seq_len) -> (batch_size, seq_len, dim)
+        x = self.embedding_layer(x)
+
+        if attention_mask is not None:
+            if attention_mask.size() != x.size()[:2]:
+                raise ValueError(
+                    f"Attention mask size {attention_mask.size()} must be equal to {(x.size()[:2])}"
+                )
+            # 0 for unmasked, -inf for masked
+            attention_mask = (1.0 - attention_mask) * torch.finfo(x.dtype).min
+
+        return self.attention(x, attention_mask=attention_mask)
+
+
+@hydra.main(config_path="config", config_name="main_real_setting", version_base=None)
 def main(cfg: DictConfig) -> None:
-    if (cfg["use_ddp"] and dist.get_rank() == 0) or not cfg["use_ddp"]:
-        wandb.init(project="benign_attention_vit")
-        wandb.config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    wandb.init(project="benign_attention_real_setting", config=wandb_config)
 
     seed = cfg["seed"]
     torch.manual_seed(seed)
+
+    if cfg["use_ddp"]:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        setup(rank, world_size)
+
+    dataset_name = cfg["dataset"]["name"]
+    if dataset_name == "cifar10":
+        model = ToyVisionTransformer(
+            size=cfg["dataset"]["size"],
+            patch_size=cfg["patch_size"],
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+            channels=cfg["dataset"]["num_channels"],
+        )
+        train_dataset, test_dataset = get_cifar10_datasets(
+            noise_ratio=cfg["noise_ratio"]
+        )
+    elif dataset_name == "sst2":
+        model = ToyTextTransformer(
+            vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+        )
+        train_dataset, test_dataset, _ = get_glue_datasets(
+            noise_ratio=cfg["noise_ratio"], task_name="sst2"
+        )
+    elif dataset_name == "agnews":
+        model = ToyTextTransformer(
+            vocab_size=30522,  # Vocab size of "bert-base-uncased" tokenizer
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+        )
+        train_dataset, test_dataset = get_agnews_datasets(
+            noise_ratio=cfg["noise_ratio"]
+        )
+    elif dataset_name == "mnist_snr":
+        model = ToyVisionTransformer(
+            size=cfg["dataset"]["size"],
+            patch_size=cfg["patch_size"],
+            num_classes=cfg["dataset"]["num_classes"],
+            dim=cfg["dim"],
+            channels=cfg["dataset"]["num_channels"],
+        )
+        train_dataset, test_dataset = get_mnist_snr_datasets(
+            noise_ratio=cfg["noise_ratio"], snr=cfg["dataset"]["signal_noise_ratio"]
+        )
+    else:
+        raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -153,35 +292,13 @@ def main(cfg: DictConfig) -> None:
         device = "mps"
     else:
         device = "cpu"
-
-    if cfg["use_ddp"]:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device = local_rank
-        setup(rank, world_size)
-
-    processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
-
-    dataset_name = cfg["dataset"]["name"]
-    if dataset_name == "cifar10":
-        train_dataset, test_dataset = get_cifar10_hf_datasets(
-            processor=processor,
-            sample_size=cfg["sample_size"],
-            noise_ratio=cfg["noise_ratio"],
-        )
-    elif dataset_name == "mnist_snr":
-        train_dataset, test_dataset = get_mnist_snr_hf_datasets(
-            processor=processor,
-            sample_size=cfg["sample_size"],
-            noise_ratio=cfg["noise_ratio"],
-            snr=cfg["dataset"]["signal_noise_ratio"],
-        )
-    else:
-        raise NotImplementedError(f"Dataset {dataset_name} is not supported.")
+    model = model.to(device)
 
     train_sampler, test_sampler = None, None
     if cfg["use_ddp"]:
+        device = local_rank
+        model = model.to(local_rank)
+        model = DDP(model, device_ids=[local_rank])
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -208,18 +325,6 @@ def main(cfg: DictConfig) -> None:
         num_workers=4,
         pin_memory=True,
     )
-
-    pretrained_model = ViTModel.from_pretrained("google/vit-base-patch16-224")
-    pretrained_model.to(device)
-    # Use only for extracting the features.
-    for param in pretrained_model.parameters():
-        param.requires_grad = False
-
-    model = OurAttention(dim=cfg["dim"], num_classes=cfg["dataset"]["num_classes"])
-    model = model.to(device)
-    if cfg["use_ddp"]:
-        pretrained_model = DDP(pretrained_model, device_ids=[local_rank])
-        model = DDP(model, device_ids=[local_rank])
 
     if cfg["optimizer"]["name"] == "sgd":
         optimizer = SGD(
@@ -248,11 +353,7 @@ def main(cfg: DictConfig) -> None:
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     logger.info(f"Config: {cfg}")
-    logger.info(
-        f"Hydra output dir: {hydra.core.hydra_config.HydraConfig.get().runtime.output_dir}"
-    )
 
-    losses = []
     train_accs = []
     test_accs = []
 
@@ -261,20 +362,30 @@ def main(cfg: DictConfig) -> None:
         if cfg["use_ddp"]:
             assert train_sampler is not None
             train_sampler.set_epoch(epoch)
-        for data, target in train_loader:
+        for input in train_loader:
             optimizer.zero_grad()
-            data, target = data.to(device), target.to(device)
-            logits = get_logits(cfg, pretrained_model, model, data)
+            logits, target = get_pred_and_target(
+                model,
+                input,
+                dataset_name,
+                device,
+            )
             loss = nn.functional.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
         scheduler.step()
 
         sum_train_corrects, sum_train_total = evaluate(
-            cfg, pretrained_model, model, train_loader, device
+            model,
+            train_loader,
+            dataset_name,
+            device,
         )
         sum_test_corrects, sum_test_total = evaluate(
-            cfg, pretrained_model, model, test_loader, device
+            model,
+            test_loader,
+            dataset_name,
+            device,
         )
         if cfg["use_ddp"]:
             dist.barrier()
@@ -286,18 +397,8 @@ def main(cfg: DictConfig) -> None:
         test_acc = sum_test_corrects.item() / sum_test_total.item()
 
         if (cfg["use_ddp"] and rank == 0) or not cfg["use_ddp"]:
-            logger.info(
-                {
-                    "epoch": epoch,
-                    "loss": loss.item(),
-                    "train_acc": train_acc,
-                    "test_acc": test_acc,
-                }
-            )
-            wandb.log(
-                {"loss": loss.item(), "train_acc": train_acc, "test_acc": test_acc}
-            )
-            losses.append(loss.item())
+            logger.info({"epoch": epoch, "train_acc": train_acc, "test_acc": test_acc})
+            wandb.log({"train_acc": train_acc, "test_acc": test_acc})
             train_accs.append(train_acc)
             test_accs.append(test_acc)
 
@@ -306,9 +407,7 @@ def main(cfg: DictConfig) -> None:
             hydra.core.hydra_config.HydraConfig.get().runtime.output_dir, "log.json"
         )
         with open(file_name, "w") as f:
-            json.dump(
-                {"losses": losses, "train_accs": train_accs, "test_accs": test_accs}, f
-            )
+            json.dump({"train_accs": train_accs, "test_accs": test_accs}, f)
 
         if cfg["save_model"]:
             torch.save(
